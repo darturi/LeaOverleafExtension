@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Overleaf Lea Formalizer Settings</title>
+    <link rel="stylesheet" href="options.css">
+  </head>
+  <body>
+    <main>
+      <h1>Overleaf Lea Formalizer</h1>
+      <form id="settings-form">
+        <label>
+          Companion URL
+          <input id="companion-url" name="companionUrl" type="url" required>
+        </label>
+        <label>
+          Local Lean workspace path
+          <input id="workspace-path" name="workspacePath" type="text" required placeholder="/absolute/path/to/lean/repo">
+        </label>
+        <label>
+          Local Lea repo path
+          <input id="lea-repo-path" name="leaRepoPath" type="text" required placeholder="/absolute/path/to/this-repo/vendor/lea-prover">
+        </label>
+        <label>
+          Lea OpenAI model
+          <input id="lea-model" name="leaModel" type="text" required>
+        </label>
+        <label>
+          Lea max turns
+          <input id="lea-max-turns" name="leaMaxTurns" type="number" min="1" max="200" required>
+        </label>
+        <button type="submit">Save settings</button>
+      </form>
+      <p id="status" role="status"></p>
+    </main>
+    <script src="options.js"></script>
+  </body>
+</html>

@@ -1,0 +1,7 @@
+{
+  "workspacePath": "/Users/danielarturi/Desktop/VIDA Personal/Overleaf1",
+  "leaRepoPath": "/Users/danielarturi/Desktop/VIDA Personal/Overleaf1/vendor/lea-prover",
+  "leaProvider": "openai",
+  "leaModel": "o4-mini",
+  "leaMaxTurns": 10
+}

@@ -1,0 +1,52 @@
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { applyEnvDefaults, loadDotEnv } from "../companion/config.mjs";
+
+test("loads .env values without overriding existing environment", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "overleaf-env-"));
+  await fs.writeFile(
+    path.join(dir, ".env"),
+    "OPENAI_API_KEY=from_file\nLEA_MODEL=o4-mini\nQUOTED=\"hello world\"\n",
+    "utf8"
+  );
+
+  const previous = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "from_shell";
+  delete process.env.LEA_MODEL;
+  delete process.env.QUOTED;
+
+  const result = loadDotEnv(dir);
+
+  assert.equal(result.loaded, true);
+  assert.equal(process.env.OPENAI_API_KEY, "from_shell");
+  assert.equal(process.env.LEA_MODEL, "o4-mini");
+  assert.equal(process.env.QUOTED, "hello world");
+
+  if (previous === undefined) {
+    delete process.env.OPENAI_API_KEY;
+  } else {
+    process.env.OPENAI_API_KEY = previous;
+  }
+  delete process.env.LEA_MODEL;
+  delete process.env.QUOTED;
+});
+
+test("applies environment defaults without replacing explicit settings", () => {
+  const settings = applyEnvDefaults(
+    { leaModel: "explicit-model" },
+    {
+      LEA_REPO_PATH: "/tmp/lea",
+      LEAN_WORKSPACE_PATH: "/tmp/workspace",
+      LEA_MODEL: "env-model",
+      LEA_MAX_TURNS: "7"
+    }
+  );
+
+  assert.equal(settings.workspacePath, "/tmp/workspace");
+  assert.equal(settings.leaRepoPath, "/tmp/lea");
+  assert.equal(settings.leaModel, "explicit-model");
+  assert.equal(settings.leaMaxTurns, 7);
+});

@@ -1,0 +1,139 @@
+.ol-lean-theorem {
+  background: rgba(55, 125, 255, 0.13);
+  border-bottom: 1px solid rgba(55, 125, 255, 0.7);
+  cursor: pointer;
+}
+
+.ol-lean-popover {
+  position: fixed;
+  z-index: 2147483647;
+  min-width: 260px;
+  max-width: 360px;
+  padding: 12px;
+  color: #172033;
+  background: #ffffff;
+  border: 1px solid rgba(23, 32, 51, 0.18);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(23, 32, 51, 0.22);
+  font: 13px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.ol-lean-popover-title {
+  margin: 0 0 8px;
+  font-weight: 700;
+}
+
+.ol-lean-popover-meta {
+  margin: 0 0 10px;
+  color: #536078;
+  word-break: break-word;
+}
+
+.ol-lean-popover-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.ol-lean-popover button {
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid rgba(23, 32, 51, 0.16);
+  border-radius: 6px;
+  background: #f8f9fc;
+  color: #172033;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ol-lean-popover button[data-primary="true"] {
+  border-color: #2357d9;
+  background: #2f65f6;
+  color: #ffffff;
+}
+
+.ol-lean-popover-status {
+  margin: 10px 0 0;
+  color: #33405c;
+  word-break: break-word;
+}
+
+.ol-lean-popover-lean {
+  max-width: 100%;
+  max-height: 180px;
+  margin: 12px 0 0;
+  padding: 10px;
+  overflow: auto;
+  border: 1px solid rgba(23, 32, 51, 0.12);
+  border-radius: 6px;
+  background: #f8f9fc;
+  color: #172033;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  white-space: pre-wrap;
+}
+
+.ol-lean-status-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483646;
+  pointer-events: none;
+}
+
+.ol-lean-status {
+  position: fixed;
+  display: flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid rgba(23, 32, 51, 0.14);
+  border-radius: 6px;
+  color: #33405c;
+  background: #eef2f8;
+  font: 11px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-weight: 700;
+  white-space: nowrap;
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.ol-lean-status-unformalized {
+  color: #6b4b00;
+  background: #fff4cc;
+  border-color: #e0b640;
+}
+
+.ol-lean-status-in_progress {
+  color: #164b8f;
+  background: #dcecff;
+  border-color: #75a8e8;
+}
+
+.ol-lean-status-formalized {
+  color: #17623a;
+  background: #dff6e8;
+  border-color: #74c995;
+}
+
+.ol-lean-status-sorry_stub {
+  color: #733b00;
+  background: #ffe9d1;
+  border-color: #d8944d;
+}
+
+.ol-lean-status-offline {
+  color: #7a2430;
+  background: #ffe1e6;
+  border-color: #d6808f;
+}
+
+.ol-lean-status-unavailable {
+  color: #5f426f;
+  background: #f1e4f8;
+  border-color: #b990c7;
+}
+
+.ol-lean-status-failed {
+  color: #7a2430;
+  background: #ffe1e6;
+  border-color: #d6808f;
+}
