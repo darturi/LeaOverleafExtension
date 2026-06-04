@@ -28,6 +28,7 @@ const DEFAULT_LEAN_TOOLCHAIN = "leanprover/lean4:v4.30.0";
 const DEFAULT_LEA_PROVIDER = "openai";
 const DEFAULT_LEA_MODEL = "o4-mini";
 const DEFAULT_LEA_MAX_TURNS = 20;
+const DEFAULT_LEA_JOB_TIMEOUT_SECONDS = 900;
 const DEFAULT_LAKEFILE = `import Lake
 open Lake DSL
 
@@ -58,6 +59,7 @@ export async function createServer({
     jobs: await readJson(jobsPath, {})
   };
   await ensureStartupWorkspace(state);
+  await recoverInterruptedJobs(state);
 
   return http.createServer(async (request, response) => {
     try {
@@ -69,6 +71,28 @@ export async function createServer({
       });
     }
   });
+}
+
+export async function recoverInterruptedJobs(state) {
+  const jobs = state.jobs || {};
+  const interruptedAt = new Date().toISOString();
+  let changed = false;
+
+  for (const job of Object.values(jobs)) {
+    if (job.status !== "in_progress") continue;
+    job.status = "failed";
+    job.finalStatus = "interrupted";
+    job.error = "Companion restarted before this Lea job finished.";
+    job.finishedAt = interruptedAt;
+    if (job.logPath) {
+      await appendLog(job.logPath, `\n[backend] ${job.error}\n`);
+    }
+    changed = true;
+  }
+
+  if (changed) {
+    await writeJson(state.jobsPath, jobs);
+  }
 }
 
 export async function handleCreateStub(payload, state) {
@@ -329,7 +353,8 @@ async function routeRequest(request, response, state) {
       leaRepoPath: state.settings.leaRepoPath || "",
       leaProvider: state.settings.leaProvider || DEFAULT_LEA_PROVIDER,
       leaModel: state.settings.leaModel || DEFAULT_LEA_MODEL,
-      leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS
+      leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
+      leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
     });
     return;
   }
@@ -365,13 +390,18 @@ async function routeRequest(request, response, state) {
     state.settings.leaProvider = String(payload.leaProvider || DEFAULT_LEA_PROVIDER);
     state.settings.leaModel = String(payload.leaModel || DEFAULT_LEA_MODEL);
     state.settings.leaMaxTurns = Number.parseInt(String(payload.leaMaxTurns || DEFAULT_LEA_MAX_TURNS), 10);
+    state.settings.leaJobTimeoutSeconds = Number.parseInt(
+      String(payload.leaJobTimeoutSeconds || state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS),
+      10
+    );
     await writeJson(state.settingsPath, state.settings);
     sendJson(response, 200, {
       ok: true,
       leaRepoPath: state.settings.leaRepoPath,
       leaProvider: state.settings.leaProvider,
       leaModel: state.settings.leaModel,
-      leaMaxTurns: state.settings.leaMaxTurns
+      leaMaxTurns: state.settings.leaMaxTurns,
+      leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds
     });
     return;
   }
@@ -515,7 +545,8 @@ async function createFormalizationJob({ state, target, theoremText }) {
     leaRepoPath: state.settings.leaRepoPath,
     leaProvider: state.settings.leaProvider || DEFAULT_LEA_PROVIDER,
     leaModel: state.settings.leaModel || DEFAULT_LEA_MODEL,
-    leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS
+    leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
+    leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
   };
 }
 
@@ -523,6 +554,7 @@ async function runLeaJob({ state, job, target, theoremText }) {
   const prompt = buildLeaPrompt({
     workspacePath: state.settings.workspacePath,
     relativePath: target.relativePath,
+    absolutePath: target.absolutePath,
     theoremLabel: target.theoremLabel,
     theoremText
   });
@@ -547,7 +579,8 @@ async function runLeaJob({ state, job, target, theoremText }) {
     args,
     cwd: job.leaRepoPath,
     env: buildLeaEnv({ baseEnv: state.env || process.env, leaRepoPath: job.leaRepoPath }),
-    logPath: job.logPath
+    logPath: job.logPath,
+    timeoutMs: job.leaJobTimeoutSeconds * 1000
   });
 
   const status = await getTheoremStatus({
@@ -561,19 +594,30 @@ async function runLeaJob({ state, job, target, theoremText }) {
   job.status = exit.code === 0 && status.status === "formalized" ? "formalized" : "failed";
   job.finalStatus = status.status;
   job.exitCode = exit.code;
+  job.timedOut = exit.timedOut;
+  if (exit.timedOut) {
+    job.error = `Lea timed out after ${job.leaJobTimeoutSeconds} seconds.`;
+  }
   job.finishedAt = new Date().toISOString();
-  await appendLog(job.logPath, `\n[backend] Lea exited with ${exit.code}; final status ${status.status}\n`);
+  const exitSummary = exit.timedOut
+    ? `Lea timed out after ${job.leaJobTimeoutSeconds} seconds`
+    : `Lea exited with ${exit.code}`;
+  await appendLog(job.logPath, `\n[backend] ${exitSummary}; final status ${status.status}\n`);
   await writeJson(state.jobsPath, state.jobs);
 }
 
-function buildLeaPrompt({ workspacePath, relativePath, theoremLabel, theoremText }) {
-  return `In the Lean workspace at ${workspacePath}, create or edit only ${relativePath}.
+function buildLeaPrompt({ workspacePath, relativePath, absolutePath, theoremLabel, theoremText }) {
+  return `In the Lean workspace at ${workspacePath}, create or edit only this file:
+${absolutePath}
+
+This absolute target path is derived from the configured workspace at companion startup. Lea is running from its own repository, so do not create ${relativePath} relative to the current working directory.
+
 Create a Lean theorem named ${theoremLabel} corresponding to this Overleaf theorem:
 
 ${theoremText}
 
 The final file must compile with no sorry/admit in theorem ${theoremLabel}.
-Do not create a placeholder theorem. If you cannot complete the proof, leave the best partial Lean file in ${relativePath}.`;
+Do not create a placeholder theorem. If you cannot complete the proof, leave the best partial Lean file in ${absolutePath}.`;
 }
 
 function buildLeaEnv({ baseEnv, leaRepoPath }) {
@@ -583,13 +627,32 @@ function buildLeaEnv({ baseEnv, leaRepoPath }) {
   };
 }
 
-function spawnAndCapture({ spawnImpl, command, args, cwd, env, logPath }) {
+function spawnAndCapture({ spawnImpl, command, args, cwd, env, logPath, timeoutMs }) {
   return new Promise((resolve, reject) => {
     const child = spawnImpl(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = timeoutMs > 0
+      ? setTimeout(() => {
+        appendLog(logPath, `\n[backend] Killing Lea after ${Math.round(timeoutMs / 1000)} seconds with no completion.\n`);
+        finish({ code: null, timedOut: true });
+        child.kill?.("SIGTERM");
+      }, timeoutMs)
+      : null;
+    timer?.unref?.();
     child.stdout?.on("data", (chunk) => appendLog(logPath, chunk.toString()));
     child.stderr?.on("data", (chunk) => appendLog(logPath, chunk.toString()));
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ code }));
+    child.on("error", (error) => {
+      if (settled) return;
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => finish({ code, timedOut: false }));
   });
 }
 

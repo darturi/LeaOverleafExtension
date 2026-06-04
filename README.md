@@ -40,13 +40,23 @@ The script does the one-time local work:
 - creates the Lean workspace files if needed
 - clones or updates Lea at `vendor/lea-prover`
 - runs `uv sync` for Lea
-- runs `lake update` and `lake exe cache get` for Mathlib
+- runs `lake update` for Mathlib only when the local Mathlib checkout is missing
+- runs `lake exe cache get` for Mathlib's compiled cache
 - writes `.env` and `.overleaf-lean-stub/settings.json` with local absolute paths
+
+After the first successful setup, rerunning `npm run setup` reuses the existing
+`.lake/packages/mathlib` checkout and skips the heavier dependency update step. To force a Lean
+dependency refresh, run:
+
+```sh
+npm run update-lean-deps
+```
 
 Then edit `.env` and replace the placeholder API key:
 
 ```text
 OPENAI_API_KEY=your_openai_key_here
+LEA_JOB_TIMEOUT_SECONDS=900
 ```
 
 Check setup:
@@ -83,8 +93,7 @@ script fetches Mathlib and its compiled cache so Lea-created files can use `impo
 If you ever need to refresh that manually, run:
 
 ```sh
-lake update
-lake exe cache get
+npm run update-lean-deps
 ```
 
 It also stores the selected workspace path in:
@@ -119,6 +128,7 @@ The main workflow expects:
 - a local clone of `https://github.com/chinmayhegde/lea-prover` at `vendor/lea-prover`
 - `uv` available on `PATH`
 - `OPENAI_API_KEY` in `.env` or exported in the shell that runs `npm start`
+- optional `LEA_JOB_TIMEOUT_SECONDS` in `.env` to fail and unblock stalled Lea runs
 - Lean and Lake available on `PATH`
 
 The extension options page stores only paths and model settings. API keys stay in `.env` or the companion process environment.

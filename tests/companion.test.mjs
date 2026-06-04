@@ -9,6 +9,7 @@ import {
   handleCreateStub,
   handleFormalize,
   handleGetStatuses,
+  recoverInterruptedJobs,
   validateWorkspace
 } from "../companion/server.mjs";
 import { buildProjectRelativeLeanPath, slugProjectId } from "../shared/leanStub.mjs";
@@ -260,7 +261,14 @@ test("formalize starts Lea without creating a placeholder file first", async () 
     "20"
   ]);
   assert.match(calls[0].options.env.PYTHONPATH, /lea-prover-/);
-  assert.match(calls[0].args.at(-1), /create or edit only Formalization\/Overleaf\/project-1\/lea_test\.lean/);
+  assert.match(
+    calls[0].args.at(-1),
+    new RegExp(escapeRegExp(path.join(workspace, "Formalization", "Overleaf", "project-1", "lea_test.lean")))
+  );
+  assert.match(
+    calls[0].args.at(-1),
+    /do not create Formalization\/Overleaf\/project-1\/lea_test\.lean relative to the current working directory/
+  );
   assert.match(calls[0].args.at(-1), /A theorem\./);
 });
 
@@ -399,6 +407,75 @@ test("statuses report failed Lea jobs when target is still missing", async () =>
   assert.match(statuses.body.statuses.failed_status_test.logTail, /failed proof/);
 });
 
+test("formalize fails a Lea job that exceeds the job timeout", async () => {
+  const workspace = await makeWorkspace();
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState(workspace, {
+    leaRepoPath: leaRepo,
+    leaJobTimeoutSeconds: 0.01,
+    env: { OPENAI_API_KEY: "test-key" },
+    spawnImpl: makeHangingSpawn([]),
+    commandExists: () => true
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "timeout_test",
+    theoremText: "A theorem."
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.status, "in_progress");
+  await waitFor(() => state.jobs[result.body.jobId]?.status === "failed");
+
+  const job = state.jobs[result.body.jobId];
+  assert.equal(job.timedOut, true);
+  assert.equal(job.exitCode, null);
+  assert.match(job.error, /timed out/);
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    theorems: [{ theoremLabel: "timeout_test", theoremText: "A theorem." }]
+  }, state);
+
+  assert.equal(statuses.statusCode, 200);
+  assert.equal(statuses.body.statuses.timeout_test.status, "failed");
+  assert.match(statuses.body.statuses.timeout_test.logTail, /Killing Lea/);
+});
+
+test("startup recovery fails interrupted in-progress jobs", async () => {
+  const workspace = await makeWorkspace();
+  const state = await makeState(workspace);
+  const logPath = path.join(path.dirname(state.jobsPath), "interrupted.log");
+  state.jobs.interrupted_job = {
+    jobId: "interrupted_job",
+    jobKey: "project-1:interrupted_status_test",
+    status: "in_progress",
+    theoremLabel: "interrupted_status_test",
+    relativePath: path.join("Formalization", "Overleaf", "project-1", "interrupted_status_test.lean"),
+    absolutePath: path.join(workspace, "Formalization", "Overleaf", "project-1", "interrupted_status_test.lean"),
+    logPath,
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: null
+  };
+
+  await recoverInterruptedJobs(state);
+
+  assert.equal(state.jobs.interrupted_job.status, "failed");
+  assert.equal(state.jobs.interrupted_job.finalStatus, "interrupted");
+  assert.match(state.jobs.interrupted_job.error, /Companion restarted/);
+  assert.ok(state.jobs.interrupted_job.finishedAt);
+  assert.match(await fs.readFile(logPath, "utf8"), /Companion restarted/);
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    theorems: [{ theoremLabel: "interrupted_status_test", theoremText: "A theorem." }]
+  }, state);
+
+  assert.equal(statuses.statusCode, 200);
+  assert.equal(statuses.body.statuses.interrupted_status_test.status, "failed");
+});
+
 async function makeWorkspace() {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "overleaf-lean-workspace-"));
   await fs.writeFile(path.join(dir, "lean-toolchain"), "leanprover/lean4:stable\n", "utf8");
@@ -422,10 +499,13 @@ async function makeState(workspacePath, overrides = {}) {
       ...(workspacePath ? { workspacePath } : {}),
       ...(overrides.leaRepoPath ? {
         leaRepoPath: overrides.leaRepoPath,
-        leaProvider: "openai",
-        leaModel: "o4-mini",
-        leaMaxTurns: 20
+      leaProvider: "openai",
+      leaModel: "o4-mini",
+      leaMaxTurns: 20,
+      ...(overrides.leaJobTimeoutSeconds ? {
+        leaJobTimeoutSeconds: overrides.leaJobTimeoutSeconds
       } : {})
+    } : {})
     },
     cache: {},
     jobs: {},
@@ -450,6 +530,10 @@ function makeHangingSpawn(calls) {
     const child = new EventEmitter();
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
+    child.kill = () => {
+      child.emit("close", null);
+      return true;
+    };
     return child;
   };
 }
@@ -462,4 +546,8 @@ async function waitFor(predicate) {
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

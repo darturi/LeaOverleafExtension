@@ -36,6 +36,7 @@ export function applyEnvDefaults(settings, env = process.env) {
     leaRepoPath: settings.leaRepoPath || env.LEA_REPO_PATH,
     leaProvider: settings.leaProvider || env.LEA_PROVIDER || "openai",
     leaModel: settings.leaModel || env.LEA_MODEL || "o4-mini",
-    leaMaxTurns: settings.leaMaxTurns || parseInt(env.LEA_MAX_TURNS || "20", 10)
+    leaMaxTurns: settings.leaMaxTurns || parseInt(env.LEA_MAX_TURNS || "20", 10),
+    leaJobTimeoutSeconds: settings.leaJobTimeoutSeconds || parseInt(env.LEA_JOB_TIMEOUT_SECONDS || "900", 10)
   };
 }

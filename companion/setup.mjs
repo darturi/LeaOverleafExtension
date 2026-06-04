@@ -11,13 +11,16 @@ const SETTINGS_PATH = path.join(APP_DIR, "settings.json");
 const ENV_PATH = path.join(PROJECT_ROOT, ".env");
 const LEA_REPO_URL = "https://github.com/chinmayhegde/lea-prover.git";
 const LEA_REPO_PATH = path.join(PROJECT_ROOT, "vendor", "lea-prover");
+const MATHLIB_PACKAGE_PATH = path.join(PROJECT_ROOT, ".lake", "packages", "mathlib");
+const REFRESH_LEAN_DEPS = process.argv.includes("--refresh-lean-deps");
 const DEFAULTS = {
   OPENAI_API_KEY: "your_openai_key_here",
   LEA_REPO_PATH,
   LEAN_WORKSPACE_PATH: PROJECT_ROOT,
   LEA_PROVIDER: "openai",
   LEA_MODEL: "o4-mini",
-  LEA_MAX_TURNS: "20"
+  LEA_MAX_TURNS: "20",
+  LEA_JOB_TIMEOUT_SECONDS: "900"
 };
 
 await main();
@@ -68,8 +71,14 @@ async function syncLeaEnvironment() {
 }
 
 async function fetchMathlib() {
-  console.log("Fetching Mathlib dependencies...");
-  await run("lake", ["update"], { cwd: PROJECT_ROOT });
+  if (REFRESH_LEAN_DEPS || !existsSync(MATHLIB_PACKAGE_PATH)) {
+    console.log("Fetching Mathlib dependencies...");
+    await run("lake", ["update"], { cwd: PROJECT_ROOT });
+  } else {
+    console.log("Mathlib dependencies already present; skipping `lake update`.");
+    console.log("Run `npm run update-lean-deps` to refresh Lean dependencies.");
+  }
+
   console.log("Fetching Mathlib compiled cache...");
   await run("lake", ["exe", "cache", "get"], { cwd: PROJECT_ROOT });
 }
@@ -82,6 +91,7 @@ async function writeLocalEnv() {
   merged.LEA_PROVIDER = merged.LEA_PROVIDER || DEFAULTS.LEA_PROVIDER;
   merged.LEA_MODEL = merged.LEA_MODEL || DEFAULTS.LEA_MODEL;
   merged.LEA_MAX_TURNS = merged.LEA_MAX_TURNS || DEFAULTS.LEA_MAX_TURNS;
+  merged.LEA_JOB_TIMEOUT_SECONDS = merged.LEA_JOB_TIMEOUT_SECONDS || DEFAULTS.LEA_JOB_TIMEOUT_SECONDS;
 
   await fs.writeFile(ENV_PATH, formatEnv(merged), "utf8");
   console.log("Wrote .env path defaults.");
@@ -95,7 +105,8 @@ async function writeLocalSettings() {
     leaRepoPath: LEA_REPO_PATH,
     leaProvider: settings.leaProvider || DEFAULTS.LEA_PROVIDER,
     leaModel: settings.leaModel || DEFAULTS.LEA_MODEL,
-    leaMaxTurns: settings.leaMaxTurns || Number(DEFAULTS.LEA_MAX_TURNS)
+    leaMaxTurns: settings.leaMaxTurns || Number(DEFAULTS.LEA_MAX_TURNS),
+    leaJobTimeoutSeconds: settings.leaJobTimeoutSeconds || Number(DEFAULTS.LEA_JOB_TIMEOUT_SECONDS)
   };
 
   await fs.mkdir(path.dirname(SETTINGS_PATH), { recursive: true });
@@ -149,7 +160,8 @@ function formatEnv(values) {
     ["LEAN_WORKSPACE_PATH", values.LEAN_WORKSPACE_PATH],
     ["LEA_PROVIDER", values.LEA_PROVIDER],
     ["LEA_MODEL", values.LEA_MODEL],
-    ["LEA_MAX_TURNS", values.LEA_MAX_TURNS]
+    ["LEA_MAX_TURNS", values.LEA_MAX_TURNS],
+    ["LEA_JOB_TIMEOUT_SECONDS", values.LEA_JOB_TIMEOUT_SECONDS]
   ];
   return `${lines.map(([key, value]) => `${key}=${value}`).join("\n")}\n`;
 }
