@@ -2,11 +2,21 @@
   const DEFAULT_COMPANION_URL = "http://127.0.0.1:31245";
   const DEFAULT_LEA_MODEL = "o4-mini";
   const DEFAULT_LEA_MAX_TURNS = 20;
+  const MODEL_FAMILY_LABELS = {
+    openai: "OpenAI",
+    gemini: "Gemini",
+    anthropic: "Anthropic"
+  };
   const DEFAULT_MODEL_OPTIONS = [
-    { id: "o4-mini", label: "o4-mini", tag: "Current default" },
-    { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", tag: "Fast" },
-    { id: "gpt-5.4", label: "GPT-5.4", tag: "Balanced" },
-    { id: "gpt-5.5", label: "GPT-5.5", tag: "Most capable" }
+    { id: "o4-mini", label: "o4-mini", family: "openai", tag: "Current default" },
+    { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", family: "openai", tag: "Fast" },
+    { id: "gpt-5.4", label: "GPT-5.4", family: "openai", tag: "Balanced" },
+    { id: "gpt-5.5", label: "GPT-5.5", family: "openai", tag: "Most capable" },
+    { id: "gemini/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", family: "gemini", tag: "Research" },
+    { id: "gemini/gemini-2.5-pro", label: "Gemini 2.5 Pro", family: "gemini", tag: "Capable" },
+    { id: "gemini/gemini-2.5-flash", label: "Gemini 2.5 Flash", family: "gemini", tag: "Fast" },
+    { id: "anthropic/claude-opus-4-8", label: "Claude Opus 4.8", family: "anthropic", tag: "Most capable" },
+    { id: "anthropic/claude-sonnet-4-6", label: "Claude Sonnet 4.6", family: "anthropic", tag: "Balanced" }
   ];
   let activePopover = null;
   let statusRefreshTimer = null;
@@ -164,6 +174,22 @@
             </div>
           </div>
         </section>
+        <section class="ol-lean-provider-panel" data-role="provider-keys">
+          <div class="ol-lean-provider-title">Model families</div>
+          <p class="ol-lean-provider-note">Keys are saved to the local .env by the companion, not to Chrome or settings.json.</p>
+          ${Object.entries(MODEL_FAMILY_LABELS).map(([family, label]) => `
+            <div class="ol-lean-provider-row" data-family="${family}">
+              <div class="ol-lean-provider-row-head">
+                <span>${label}</span>
+                <strong data-role="provider-status">Missing</strong>
+              </div>
+              <div class="ol-lean-provider-key-controls">
+                <button type="button" class="ol-lean-provider-key-button" data-role="provider-key-toggle" data-family="${family}">Add key</button>
+                <input type="password" autocomplete="off" spellcheck="false" data-role="provider-key-input" data-family="${family}" placeholder="${label} API key" hidden>
+              </div>
+            </div>
+          `).join("")}
+        </section>
         <section class="ol-lean-settings-panel">
           <label>
             <span>Model</span>
@@ -188,6 +214,20 @@
     closeButton.addEventListener("click", closePopover);
     modelSelect.addEventListener("change", markSettingsDirty);
     maxTurnsInput.addEventListener("input", markSettingsDirty);
+    for (const button of popover.querySelectorAll("[data-role='provider-key-toggle']")) {
+      button.addEventListener("click", () => {
+        const input = popover.querySelector(`[data-role='provider-key-input'][data-family='${button.dataset.family}']`);
+        if (!input) return;
+        input.hidden = false;
+        input.focus();
+      });
+    }
+    for (const input of popover.querySelectorAll("[data-role='provider-key-input']")) {
+      input.addEventListener("input", () => {
+        refreshModelAvailability(popover);
+        markSettingsDirty();
+      });
+    }
     saveButton.addEventListener("click", async () => {
       saveButton.disabled = true;
       status.textContent = "Saving Lea settings...";
@@ -195,6 +235,9 @@
         const settings = await savePopoverSettings(popover);
         popover.dataset.savedModel = settings.leaModel;
         popover.dataset.savedMaxTurns = String(settings.leaMaxTurns);
+        renderProviderKeys(popover, settings.leaProviderKeys || {});
+        clearProviderKeyInputs(popover);
+        refreshModelAvailability(popover);
         markSettingsDirty();
         status.textContent = "Settings saved.";
       } catch (error) {
@@ -215,9 +258,15 @@
     scheduleUsageRefresh(popover);
 
     function markSettingsDirty() {
+      const family = getModelFamily(
+        getStoredModelOptions(popover),
+        modelSelect.value || popover.dataset.savedModel || DEFAULT_LEA_MODEL
+      );
+      const selectedFamilyConfigured = Boolean(getEffectiveProviderKeyStatus(popover)[family]?.configured);
       const dirty = modelSelect.value !== popover.dataset.savedModel ||
-        String(Number.parseInt(maxTurnsInput.value, 10) || DEFAULT_LEA_MAX_TURNS) !== popover.dataset.savedMaxTurns;
-      saveButton.disabled = !dirty;
+        String(Number.parseInt(maxTurnsInput.value, 10) || DEFAULT_LEA_MAX_TURNS) !== popover.dataset.savedMaxTurns ||
+        hasProviderKeyInput(popover);
+      saveButton.disabled = !dirty || !selectedFamilyConfigured;
     }
   }
 
@@ -481,7 +530,8 @@
         leaApiBaseUrl: payload.leaApiBaseUrl || stored.leaApiBaseUrl || "http://127.0.0.1:8000",
         leaModel: payload.leaModel || stored.leaModel || DEFAULT_LEA_MODEL,
         leaMaxTurns: payload.leaMaxTurns || stored.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
-        leaModelOptions: payload.leaModelOptions || DEFAULT_MODEL_OPTIONS
+        leaModelOptions: payload.leaModelOptions || DEFAULT_MODEL_OPTIONS,
+        leaProviderKeys: payload.leaProviderKeys || {}
       };
       await chrome.storage.sync.set({
         companionUrl: settings.companionUrl,
@@ -495,7 +545,8 @@
       return {
         ...stored,
         companionUrl: baseUrl,
-        leaModelOptions: DEFAULT_MODEL_OPTIONS
+        leaModelOptions: DEFAULT_MODEL_OPTIONS,
+        leaProviderKeys: {}
       };
     }
   }
@@ -504,24 +555,121 @@
     const settings = await loadCompanionSettings();
     const modelSelect = popover.querySelector("[data-role='model']");
     const maxTurnsInput = popover.querySelector("[data-role='max-turns']");
-    renderModelOptions(modelSelect, settings.leaModelOptions || DEFAULT_MODEL_OPTIONS, settings.leaModel || DEFAULT_LEA_MODEL);
+    popover.dataset.modelOptions = JSON.stringify(settings.leaModelOptions || DEFAULT_MODEL_OPTIONS);
+    renderProviderKeys(popover, settings.leaProviderKeys || {});
+    renderModelOptions(
+      modelSelect,
+      settings.leaModelOptions || DEFAULT_MODEL_OPTIONS,
+      settings.leaModel || DEFAULT_LEA_MODEL,
+      getEffectiveProviderKeyStatus(popover)
+    );
     maxTurnsInput.value = String(settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS);
     popover.dataset.savedModel = modelSelect.value;
     popover.dataset.savedMaxTurns = String(Number.parseInt(maxTurnsInput.value, 10) || DEFAULT_LEA_MAX_TURNS);
     popover.querySelector("[data-role='save-settings']").disabled = true;
   }
 
-  function renderModelOptions(select, options, selectedModel) {
+  function renderModelOptions(select, options, selectedModel, providerKeys = {}) {
     select.replaceChildren();
+    const byFamily = new Map();
     for (const model of options) {
-      const option = document.createElement("option");
-      option.value = model.id;
-      option.textContent = model.tag ? `${model.label} - ${model.tag}` : model.label;
-      select.appendChild(option);
+      const family = model.family || "openai";
+      if (!byFamily.has(family)) {
+        byFamily.set(family, []);
+      }
+      byFamily.get(family).push(model);
+    }
+
+    for (const [family, models] of byFamily) {
+      const group = document.createElement("optgroup");
+      group.label = MODEL_FAMILY_LABELS[family] || family;
+      const familyConfigured = Boolean(providerKeys[family]?.configured);
+      for (const model of models) {
+        const option = document.createElement("option");
+        option.value = model.id;
+        option.textContent = model.tag ? `${model.label} - ${model.tag}` : model.label;
+        option.disabled = !familyConfigured && model.id !== selectedModel;
+        group.appendChild(option);
+      }
+      select.appendChild(group);
     }
     select.value = [...select.options].some((option) => option.value === selectedModel)
       ? selectedModel
       : DEFAULT_LEA_MODEL;
+  }
+
+  function renderProviderKeys(popover, providerKeys) {
+    popover.dataset.providerKeys = JSON.stringify(providerKeys || {});
+    for (const family of Object.keys(MODEL_FAMILY_LABELS)) {
+      const row = popover.querySelector(`.ol-lean-provider-row[data-family='${family}']`);
+      if (!row) continue;
+      const configured = Boolean(providerKeys?.[family]?.configured);
+      const status = row.querySelector("[data-role='provider-status']");
+      const button = row.querySelector("[data-role='provider-key-toggle']");
+      row.dataset.configured = configured ? "true" : "false";
+      status.textContent = configured ? "Configured" : "Missing";
+      if (button) button.textContent = configured ? "Replace key" : "Add key";
+    }
+  }
+
+  function refreshModelAvailability(popover) {
+    const modelSelect = popover.querySelector("[data-role='model']");
+    const selected = modelSelect.value || popover.dataset.savedModel || DEFAULT_LEA_MODEL;
+    renderModelOptions(modelSelect, getStoredModelOptions(popover), selected, getEffectiveProviderKeyStatus(popover));
+  }
+
+  function getStoredModelOptions(popover) {
+    try {
+      const options = JSON.parse(popover.dataset.modelOptions || "[]");
+      return Array.isArray(options) && options.length > 0 ? options : DEFAULT_MODEL_OPTIONS;
+    } catch {
+      return DEFAULT_MODEL_OPTIONS;
+    }
+  }
+
+  function getSavedProviderKeyStatus(popover) {
+    try {
+      return JSON.parse(popover.dataset.providerKeys || "{}") || {};
+    } catch {
+      return {};
+    }
+  }
+
+  function getEffectiveProviderKeyStatus(popover) {
+    const status = { ...getSavedProviderKeyStatus(popover) };
+    for (const input of popover.querySelectorAll("[data-role='provider-key-input']")) {
+      if (!input.value.trim()) continue;
+      status[input.dataset.family] = {
+        ...(status[input.dataset.family] || {}),
+        configured: true
+      };
+    }
+    return status;
+  }
+
+  function getModelFamily(options, modelId) {
+    return options.find((model) => model.id === modelId)?.family || "openai";
+  }
+
+  function collectProviderApiKeyPatch(popover) {
+    const patch = {};
+    for (const input of popover.querySelectorAll("[data-role='provider-key-input']")) {
+      const value = input.value.trim();
+      if (value) patch[input.dataset.family] = value;
+    }
+    return patch;
+  }
+
+  function hasProviderKeyInput(popover) {
+    return [...popover.querySelectorAll("[data-role='provider-key-input']")]
+      .some((input) => Boolean(input.value.trim()));
+  }
+
+  function clearProviderKeyInputs(popover) {
+    for (const input of popover.querySelectorAll("[data-role='provider-key-input']")) {
+      input.value = "";
+      input.hidden = true;
+    }
   }
 
   async function savePopoverSettings(popover) {
@@ -535,9 +683,9 @@
       body: JSON.stringify({
         leaRepoPath: current.leaRepoPath,
         leaApiBaseUrl: current.leaApiBaseUrl,
-        leaProvider: "openai",
         leaModel,
-        leaMaxTurns
+        leaMaxTurns,
+        leaProviderApiKeys: collectProviderApiKeyPatch(popover)
       })
     });
     const payload = await response.json().catch(() => ({}));

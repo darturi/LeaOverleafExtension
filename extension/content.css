@@ -465,6 +465,88 @@
   background: #e5e7eb;
 }
 
+.ol-lean-provider-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid #e5e7eb;
+}
+
+.ol-lean-provider-title {
+  color: #6b7280;
+  font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.ol-lean-provider-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 7px 8px;
+  border: 1px solid #e5e7eb;
+  border-radius: 7px;
+  background: #f9fafb;
+}
+
+.ol-lean-provider-row[data-configured="true"] {
+  border-color: #c7d2fe;
+  background: #eef2ff;
+}
+
+.ol-lean-provider-row-head,
+.ol-lean-provider-key-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ol-lean-provider-note {
+  margin: 0;
+  color: #6b7280;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.ol-lean-provider-row-head span {
+  color: #374151;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.ol-lean-provider-row-head strong {
+  color: #b91c1c;
+  font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.ol-lean-provider-row[data-configured="true"] .ol-lean-provider-row-head strong {
+  color: #4338ca;
+}
+
+.ol-lean-provider-key-button {
+  min-height: 26px;
+  padding: 4px 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  color: #374151;
+  background: #ffffff;
+  font-size: 11px;
+}
+
+.ol-lean-provider-key-button:hover {
+  border-color: #7c3aed;
+  color: #6d28d9;
+}
+
+.ol-lean-provider-key-controls input {
+  flex: 1;
+  min-width: 0;
+}
+
 .ol-lean-settings-panel {
   display: flex;
   flex-direction: column;

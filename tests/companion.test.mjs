@@ -55,9 +55,12 @@ test("builds Lea-compatible Overleaf project slugs and markdown paths", () => {
   );
 });
 
-test("settings response includes OpenAI model options", async () => {
+test("settings response includes model families and key status", async () => {
   const leaRepo = await makeLeaRepo();
-  const state = await makeState({ leaRepoPath: leaRepo });
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "env-openai", ANTHROPIC_API_KEY: "env-anthropic" }
+  });
 
   const response = buildSettingsResponse(state);
 
@@ -66,51 +69,292 @@ test("settings response includes OpenAI model options", async () => {
     "o4-mini",
     "gpt-5.4-mini",
     "gpt-5.4",
-    "gpt-5.5"
+    "gpt-5.5",
+    "gemini/gemini-3.1-pro-preview",
+    "gemini/gemini-2.5-pro",
+    "gemini/gemini-2.5-flash",
+    "anthropic/claude-opus-4-8",
+    "anthropic/claude-sonnet-4-6"
   ]);
+  assert.equal(response.leaModelOptions.find((model) => model.id === "o4-mini").family, "openai");
+  assert.equal(response.leaModelOptions.find((model) => model.id === "gemini/gemini-2.5-pro").family, "gemini");
+  assert.equal(response.leaProviderKeys.openai.configured, true);
+  assert.equal(response.leaProviderKeys.gemini.configured, false);
+  assert.equal(response.leaProviderKeys.anthropic.configured, true);
 });
 
-test("settings reject non-OpenAI providers and unsupported models", async () => {
+test("settings reject unsupported models and missing family keys", async () => {
   const leaRepo = await makeLeaRepo();
-  const state = await makeState({ leaRepoPath: leaRepo });
+  const state = await makeState({ leaRepoPath: leaRepo, env: {} });
 
-  const badProvider = await handleUpdateLeaSettings({
-    leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
-    leaProvider: "anthropic",
-    leaModel: "gpt-5.4",
-    leaMaxTurns: 20
-  }, state);
   const badModel = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
     leaApiBaseUrl: "http://127.0.0.1:8000",
-    leaProvider: "openai",
-    leaModel: "claude-sonnet-4-6",
+    leaModel: "anthropic/claude-does-not-exist",
+    leaMaxTurns: 20
+  }, state);
+  const missingGeminiKey = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaModel: "gemini/gemini-2.5-pro",
     leaMaxTurns: 20
   }, state);
 
-  assert.equal(badProvider.statusCode, 400);
-  assert.equal(badProvider.body.error, "invalid_lea_provider");
   assert.equal(badModel.statusCode, 400);
   assert.equal(badModel.body.error, "invalid_lea_model");
+  assert.equal(missingGeminiKey.statusCode, 400);
+  assert.equal(missingGeminiKey.body.error, "missing_gemini_key");
 });
 
-test("settings save supported OpenAI models", async () => {
+test("settings save supported models when their family key is configured", async () => {
   const leaRepo = await makeLeaRepo();
-  const state = await makeState({ leaRepoPath: leaRepo });
+  const state = await makeState({ leaRepoPath: leaRepo, env: { OPENAI_API_KEY: "openai-key", GEMINI_API_KEY: "gemini-key", ANTHROPIC_API_KEY: "anthropic-key" } });
+
+  const openAiResult = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaModel: "gpt-5.4-mini",
+    leaMaxTurns: 34
+  }, state);
+  const geminiResult = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaModel: "gemini/gemini-2.5-flash",
+    leaMaxTurns: 12
+  }, state);
+  const anthropicResult = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaModel: "anthropic/claude-sonnet-4-6",
+    leaMaxTurns: 21
+  }, state);
+
+  assert.equal(openAiResult.statusCode, 200);
+  assert.equal(openAiResult.body.leaProvider, "openai");
+  assert.equal(openAiResult.body.leaModel, "gpt-5.4-mini");
+  assert.equal(openAiResult.body.leaMaxTurns, 34);
+  assert.equal(geminiResult.statusCode, 200);
+  assert.equal(geminiResult.body.leaProvider, "gemini");
+  assert.equal(geminiResult.body.leaModel, "gemini/gemini-2.5-flash");
+  assert.equal(anthropicResult.statusCode, 200);
+  assert.equal(anthropicResult.body.leaProvider, "anthropic");
+  assert.equal(anthropicResult.body.leaModel, "anthropic/claude-sonnet-4-6");
+});
+
+test("settings normalize legacy Anthropic model ids", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaModel: "anthropic/claude-sonnet-4-20250514",
+    env: { ANTHROPIC_API_KEY: "anthropic-key" }
+  });
+
+  assert.equal(buildSettingsResponse(state).leaModel, "anthropic/claude-sonnet-4-6");
 
   const result = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
     leaApiBaseUrl: "http://127.0.0.1:8000",
-    leaProvider: "openai",
-    leaModel: "gpt-5.4-mini",
-    leaMaxTurns: 34
+    leaModel: "anthropic/claude-opus-4-20250514",
+    leaMaxTurns: 20
   }, state);
 
   assert.equal(result.statusCode, 200);
-  assert.equal(result.body.leaProvider, "openai");
-  assert.equal(result.body.leaModel, "gpt-5.4-mini");
-  assert.equal(result.body.leaMaxTurns, 34);
+  assert.equal(result.body.leaModel, "anthropic/claude-opus-4-8");
+});
+
+test("settings writes scrub legacy key fields", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaModel: "anthropic/claude-sonnet-4-20250514",
+    leaApiKey: "legacy-openai-key",
+    leaProviderApiKeys: { anthropic: "legacy-anthropic-key" },
+    env: {}
+  });
+
+  const startup = await ensureStartupLeaRuntime(state);
+  assert.equal(startup.ok, true);
+  assert.equal(state.settings.leaModel, "anthropic/claude-sonnet-4-6");
+  assert.equal(state.settings.leaApiKey, undefined);
+  assert.equal(state.settings.leaProviderApiKeys, undefined);
+  assert.equal(state.env.ANTHROPIC_API_KEY, "legacy-anthropic-key");
+  assert.equal(state.env.OPENAI_API_KEY, "legacy-openai-key");
+
+  const envFile = await fs.readFile(state.envPath, "utf8");
+  assert.match(envFile, /ANTHROPIC_API_KEY=legacy-anthropic-key/);
+  assert.match(envFile, /OPENAI_API_KEY=legacy-openai-key/);
+  const saved = JSON.parse(await fs.readFile(state.settingsPath, "utf8"));
+  assert.equal(saved.leaModel, "anthropic/claude-sonnet-4-6");
+  assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaApiKey"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaProviderApiKeys"), false);
+});
+
+test("settings save provider key patches to env file without settings persistence", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "openai-key" }
+  });
+
+  const result = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaModel: "anthropic/claude-sonnet-4-6",
+    leaMaxTurns: 20,
+    leaProviderApiKeys: { anthropic: "anthropic-key" }
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.leaProviderKeys.anthropic.configured, true);
+  assert.equal(state.env.ANTHROPIC_API_KEY, "anthropic-key");
+
+  const envFile = await fs.readFile(state.envPath, "utf8");
+  assert.match(envFile, /ANTHROPIC_API_KEY=anthropic-key/);
+
+  const saved = JSON.parse(await fs.readFile(state.settingsPath, "utf8"));
+  assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaApiKey"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaProviderApiKeys"), false);
+});
+
+test("settings reject invalid submitted Gemini keys before persistence", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "openai-key" },
+    fetchImpl: makeProviderValidationFetch(calls, { gemini: 401 })
+  });
+
+  const result = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaModel: "gemini/gemini-2.5-pro",
+    leaMaxTurns: 20,
+    leaProviderApiKeys: { gemini: "PLACEHOLDER" }
+  }, state);
+
+  assert.equal(result.statusCode, 400);
+  assert.equal(result.body.error, "invalid_gemini_key");
+  assert.match(result.body.message, /Gemini API key was rejected/);
+  assert.equal(state.env.GEMINI_API_KEY, undefined);
+  assert.equal(await fileExists(state.envPath), false);
+  assert.deepEqual(calls.map((call) => call.family), ["gemini"]);
+});
+
+test("settings reject invalid existing key for selected provider family", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { GEMINI_API_KEY: "bad-gemini-key" },
+    fetchImpl: makeProviderValidationFetch(calls, { gemini: 403 })
+  });
+
+  const result = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaModel: "gemini/gemini-2.5-flash",
+    leaMaxTurns: 20
+  }, state);
+
+  assert.equal(result.statusCode, 400);
+  assert.equal(result.body.error, "invalid_gemini_key");
+  assert.equal(state.settings.leaModel, "o4-mini");
+  assert.deepEqual(calls.map((call) => call.family), ["gemini"]);
+});
+
+test("settings validate newly entered non-selected provider keys", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "openai-key" },
+    fetchImpl: makeProviderValidationFetch(calls, { anthropic: 401 })
+  });
+
+  const result = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaModel: "gpt-5.4-mini",
+    leaMaxTurns: 20,
+    leaProviderApiKeys: { anthropic: "bad-anthropic-key" }
+  }, state);
+
+  assert.equal(result.statusCode, 400);
+  assert.equal(result.body.error, "invalid_anthropic_key");
+  assert.equal(state.env.ANTHROPIC_API_KEY, undefined);
+  assert.deepEqual(calls.map((call) => call.family), ["anthropic"]);
+});
+
+test("settings save valid submitted keys after provider verification", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "openai-key" },
+    fetchImpl: makeProviderValidationFetch(calls)
+  });
+
+  const result = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaModel: "gemini/gemini-2.5-flash",
+    leaMaxTurns: 20,
+    leaProviderApiKeys: { gemini: "valid-gemini-key" }
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.leaProviderKeys.gemini.configured, true);
+  assert.equal(state.env.GEMINI_API_KEY, "valid-gemini-key");
+  assert.deepEqual(calls.map((call) => call.family), ["gemini"]);
+
+  const envFile = await fs.readFile(state.envPath, "utf8");
+  assert.match(envFile, /GEMINI_API_KEY=valid-gemini-key/);
+});
+
+test("settings reject provider key verification network failures", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "openai-key" },
+    fetchImpl: makeProviderValidationFetch(calls, { openai: "throw" })
+  });
+
+  const result = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaModel: "gpt-5.4-mini",
+    leaMaxTurns: 20
+  }, state);
+
+  assert.equal(result.statusCode, 400);
+  assert.equal(result.body.error, "openai_key_verification_failed");
+  assert.match(result.body.message, /Could not verify OpenAI API key/);
+});
+
+test("settings do not validate untouched non-selected provider keys", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: {
+      OPENAI_API_KEY: "openai-key",
+      GEMINI_API_KEY: "existing-gemini-key",
+      ANTHROPIC_API_KEY: "existing-anthropic-key"
+    },
+    fetchImpl: makeProviderValidationFetch(calls)
+  });
+
+  const result = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaModel: "gpt-5.4",
+    leaMaxTurns: 20
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  assert.deepEqual(calls.map((call) => call.family), ["openai"]);
 });
 
 test("formalize starts Lea without root workspace paths", async () => {
@@ -136,6 +380,7 @@ test("formalize starts Lea without root workspace paths", async () => {
   assert.equal(calls[0].url, "http://127.0.0.1:8000/v1/runs");
   assert.equal(calls[0].body.config.model.name, "o4-mini");
   assert.equal(calls[0].body.config.model.model_kwargs.api_key, "test-key");
+  assert.equal(calls[0].body.config.model.model_kwargs.max_tokens, 16384);
   assert.equal(calls[0].body.config.agent.max_turns, 20);
   assert.deepEqual(calls[0].body.project, {
     project_id: "project-1",
@@ -146,6 +391,51 @@ test("formalize starts Lea without root workspace paths", async () => {
   assert.match(calls[0].body.task, /A theorem\./);
   assert.match(calls[0].body.task, /Use the Lea project context/);
   assert.doesNotMatch(calls[0].body.task, /also record the theorem/);
+});
+
+test("formalize sends the selected model family key to Lea", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaModel: "gemini/gemini-2.5-pro",
+    env: { GEMINI_API_KEY: "gemini-key" },
+    fetchImpl: makeLeaApiFetch(calls)
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "gemini_test",
+    theoremText: "A theorem."
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  await waitFor(() => calls.length > 0);
+  assert.equal(calls[0].body.config.model.name, "gemini/gemini-2.5-pro");
+  assert.equal(calls[0].body.config.model.model_kwargs.api_key, "gemini-key");
+  assert.equal(calls[0].body.config.model.model_kwargs.max_tokens, 16384);
+});
+
+test("formalize sends normalized legacy model ids to Lea", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaModel: "anthropic/claude-sonnet-4-20250514",
+    env: { ANTHROPIC_API_KEY: "anthropic-key" },
+    fetchImpl: makeLeaApiFetch(calls)
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "anthropic_test",
+    theoremText: "A theorem."
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  await waitFor(() => calls.length > 0);
+  assert.equal(calls[0].body.config.model.name, "anthropic/claude-sonnet-4-6");
+  assert.equal(calls[0].body.config.model.model_kwargs.api_key, "anthropic-key");
 });
 
 test("formalize returns active job instead of starting a duplicate", async () => {
@@ -918,12 +1208,15 @@ async function makeState(overrides = {}) {
   return {
     settingsPath: path.join(appDir, "settings.json"),
     jobsPath: path.join(appDir, "jobs.json"),
+    envPath: path.join(appDir, ".env"),
     settings: {
       ...(overrides.leaRepoPath ? {
         leaRepoPath: overrides.leaRepoPath,
         leaWorkspacePath: buildLeaWorkspacePath(overrides.leaRepoPath),
-        leaProvider: "openai",
-        leaModel: "o4-mini",
+        leaProvider: overrides.leaProvider || "openai",
+        leaModel: overrides.leaModel || "o4-mini",
+        leaProviderApiKeys: overrides.leaProviderApiKeys || {},
+        ...(overrides.leaApiKey ? { leaApiKey: overrides.leaApiKey } : {}),
         leaMaxTurns: 20,
         ...(overrides.leaJobTimeoutSeconds ? {
           leaJobTimeoutSeconds: overrides.leaJobTimeoutSeconds
@@ -932,7 +1225,7 @@ async function makeState(overrides = {}) {
     },
     jobs: {},
     env: overrides.env || process.env,
-    fetchImpl: overrides.fetchImpl
+    fetchImpl: overrides.fetchImpl || makeProviderValidationFetch([])
   };
 }
 
@@ -979,6 +1272,29 @@ function makeLeaApiFetch(calls, options = {}) {
     }
     return jsonResponse(200, options.statusBody || { run_id: "api-run-1", status: "running" });
   };
+}
+
+function makeProviderValidationFetch(calls, statuses = {}) {
+  return async (url, requestOptions = {}) => {
+    const family = inferProviderValidationFamily(url);
+    if (!family) {
+      throw new Error(`Unexpected provider validation URL: ${url}`);
+    }
+    calls.push({ family, url, options: requestOptions });
+    const status = statuses[family] || 200;
+    if (status === "throw") {
+      throw new Error(`${family} unavailable`);
+    }
+    return jsonResponse(status, { data: [] });
+  };
+}
+
+function inferProviderValidationFamily(url) {
+  const text = String(url);
+  if (text.startsWith("https://api.openai.com/")) return "openai";
+  if (text.startsWith("https://generativelanguage.googleapis.com/")) return "gemini";
+  if (text.startsWith("https://api.anthropic.com/")) return "anthropic";
+  return "";
 }
 
 function sseResponse(status, frames) {
