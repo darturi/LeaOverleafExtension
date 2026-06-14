@@ -548,6 +548,45 @@ test("stub starts Lea in theorem translation approval mode and records a sorry s
   );
 });
 
+test("stub allows retrying failed unformalized theorems", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls, {
+      approval: {
+        leanCode: "import Mathlib\n\ntheorem retried_failed_stub_test : True := by sorry",
+        theoremName: "retried_failed_stub_test"
+      }
+    })
+  });
+  state.jobs.failed_job = {
+    jobId: "failed_job",
+    jobKey: "project-1:failed_stub_retry",
+    status: "failed",
+    theoremLabel: "failed_stub_retry",
+    relativePath: path.join("workspace", "projects", "project-1.md"),
+    absolutePath: path.join(leaRepo, "workspace", "projects", "project-1.md"),
+    logPath: path.join(path.dirname(state.jobsPath), "failed-stub-retry.log"),
+    leaRepoPath: leaRepo,
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:00:01.000Z"
+  };
+  await fs.writeFile(state.jobs.failed_job.logPath, "failed proof\n", "utf8");
+
+  const result = await handleStub({
+    overleafProjectId: "project-1",
+    theoremLabel: "failed_stub_retry",
+    theoremText: "A theorem."
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.status, "sorry_stub");
+  assert.equal(result.body.declarationName, "retried_failed_stub_test");
+  assert.equal(calls[0].body.config.agent.permission_tier, "theorem_translation");
+});
+
 test("statuses report saved sorry stubs", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
@@ -1020,6 +1059,153 @@ test("formalize includes multiple resolved theorem uses in source order", async 
     assert.notEqual(secondIndex, -1);
     assert.ok(firstIndex < secondIndex);
     assert.match(task, /Formalization Guidance: Reuse the support lemmas in the listed order\./);
+  } finally {
+    restorePath();
+  }
+});
+
+test("formalize allows theorem uses backed by sorry stubs", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const dependencyProofPath = path.join("workspace", "proofs", "Lea", "Project1", "stub_support.lean");
+  const targetProofPath = path.join("workspace", "proofs", "Lea", "Project1", "uses_stub_support.lean");
+  const restorePath = await installFakeLake();
+  try {
+    await writeLeaProjectProof(leaRepo, dependencyProofPath, "theorem stub_support : True := by\n  sorry\n");
+    await writeLeaProjectMarkdown(leaRepo, "project-1", {
+      theoremName: "stub_support",
+      proofPath: dependencyProofPath,
+      moduleName: "Lea.Project1.stub_support"
+    });
+    const state = await makeState({
+      leaRepoPath: leaRepo,
+      env: { OPENAI_API_KEY: "test-key" },
+      fetchImpl: makeLeaApiFetch(calls, {
+        statusBody: { run_id: "api-run-1", status: "completed", result: { reason: "success" } },
+        onStatusRequest: async () => {
+          await writeLeaProjectProof(leaRepo, targetProofPath, "theorem uses_stub_support : True := by\n  trivial\n");
+          await writeLeaProjectMarkdownEntries(leaRepo, "project-1", [
+            {
+              theoremName: "stub_support",
+              proofPath: dependencyProofPath,
+              moduleName: "Lea.Project1.stub_support"
+            },
+            {
+              theoremName: "uses_stub_support",
+              proofPath: targetProofPath
+            }
+          ]);
+        }
+      })
+    });
+
+    const result = await handleFormalize({
+      overleafProjectId: "project-1",
+      theoremLabel: "uses_stub_support",
+      theoremText: "theorem uses_stub_support : True := by",
+      theoremUses: ["stub_support"]
+    }, state);
+
+    assert.equal(result.statusCode, 200);
+    await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
+    assert.match(
+      calls[0].body.task,
+      new RegExp(`To formalize the theorem make use of the stub_support theorem at ${escapeRegExp(path.join(leaRepo, dependencyProofPath))}\\.`)
+    );
+    assert.deepEqual(state.jobs[result.body.jobId].theoremUses, [{
+      theoremLabel: "stub_support",
+      declarationName: "stub_support",
+      relativePath: dependencyProofPath,
+      absolutePath: path.join(leaRepo, dependencyProofPath),
+      moduleName: "Lea.Project1.stub_support"
+    }]);
+  } finally {
+    restorePath();
+  }
+});
+
+test("formalize allows theorem uses backed by failed sorry stubs", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const dependencyProofPath = path.join("workspace", "proofs", "Lea", "Project1", "failed_stub_support.lean");
+  const targetProofPath = path.join("workspace", "proofs", "Lea", "Project1", "uses_failed_stub_support.lean");
+  const restorePath = await installFakeLake();
+  try {
+    await writeLeaProjectProof(leaRepo, dependencyProofPath, "theorem failed_stub_support : True := by\n  sorry\n");
+    await writeLeaProjectMarkdown(leaRepo, "project-1", {
+      theoremName: "failed_stub_support",
+      proofPath: dependencyProofPath,
+      moduleName: "Lea.Project1.failed_stub_support"
+    });
+    const state = await makeState({
+      leaRepoPath: leaRepo,
+      env: { OPENAI_API_KEY: "test-key" },
+      fetchImpl: makeLeaApiFetch(calls, {
+        statusBody: { run_id: "api-run-1", status: "completed", result: { reason: "success" } },
+        onStatusRequest: async () => {
+          await writeLeaProjectProof(leaRepo, targetProofPath, "theorem uses_failed_stub_support : True := by\n  trivial\n");
+          await writeLeaProjectMarkdownEntries(leaRepo, "project-1", [
+            {
+              theoremName: "failed_stub_support",
+              proofPath: dependencyProofPath,
+              moduleName: "Lea.Project1.failed_stub_support"
+            },
+            {
+              theoremName: "uses_failed_stub_support",
+              proofPath: targetProofPath
+            }
+          ]);
+        }
+      })
+    });
+    state.jobs.failed_stub_job = {
+      jobId: "failed_stub_job",
+      jobKey: "project-1:failed_stub_support",
+      status: "failed",
+      finalStatus: "sorry_stub",
+      theoremLabel: "failed_stub_support",
+      declarationName: "failed_stub_support",
+      recordedProofPath: dependencyProofPath,
+      moduleName: "Lea.Project1.failed_stub_support",
+      relativePath: path.join("workspace", "projects", "project-1.md"),
+      absolutePath: path.join(leaRepo, "workspace", "projects", "project-1.md"),
+      logPath: path.join(path.dirname(state.jobsPath), "failed-stub-support.log"),
+      leaRepoPath: leaRepo,
+      startedAt: "2026-01-01T00:00:00.000Z",
+      finishedAt: "2026-01-01T00:00:01.000Z"
+    };
+    await fs.writeFile(state.jobs.failed_stub_job.logPath, "failed after stub\n", "utf8");
+
+    const statuses = await handleGetStatuses({
+      overleafProjectId: "project-1",
+      theorems: [{ theoremLabel: "failed_stub_support", theoremText: "A theorem." }]
+    }, state);
+
+    assert.equal(statuses.statusCode, 200);
+    assert.equal(statuses.body.statuses.failed_stub_support.status, "failed");
+    assert.equal(statuses.body.statuses.failed_stub_support.effectiveStatus, "sorry_stub");
+    assert.equal(statuses.body.statuses.failed_stub_support.leanStatement, "theorem failed_stub_support : True");
+
+    const result = await handleFormalize({
+      overleafProjectId: "project-1",
+      theoremLabel: "uses_failed_stub_support",
+      theoremText: "theorem uses_failed_stub_support : True := by",
+      theoremUses: ["failed_stub_support"]
+    }, state);
+
+    assert.equal(result.statusCode, 200);
+    await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
+    assert.match(
+      calls[0].body.task,
+      new RegExp(`To formalize the theorem make use of the failed_stub_support theorem at ${escapeRegExp(path.join(leaRepo, dependencyProofPath))}\\.`)
+    );
+    assert.deepEqual(state.jobs[result.body.jobId].theoremUses, [{
+      theoremLabel: "failed_stub_support",
+      declarationName: "failed_stub_support",
+      relativePath: dependencyProofPath,
+      absolutePath: path.join(leaRepo, dependencyProofPath),
+      moduleName: "Lea.Project1.failed_stub_support"
+    }]);
   } finally {
     restorePath();
   }
@@ -1524,6 +1710,7 @@ test("failed jobs take precedence over completed project markdown entries", asyn
 
   assert.equal(statuses.statusCode, 200);
   assert.equal(statuses.body.statuses.failed_precedence_test.status, "failed");
+  assert.equal(statuses.body.statuses.failed_precedence_test.effectiveStatus, "unformalized");
   assert.match(statuses.body.statuses.failed_precedence_test.logTail, /failed proof/);
 });
 

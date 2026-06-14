@@ -244,7 +244,8 @@ export async function handleStub(payload, state) {
     theoremLabel,
     jobs: state.jobs || {}
   });
-  if (currentStatus.status !== "unformalized") {
+  const equivalentStatus = getEquivalentTheoremStatus(currentStatus);
+  if (equivalentStatus.status !== "unformalized") {
     return errorResponse(409, "not_unformalized", "Stub is only available for unformalized theorems.");
   }
 
@@ -761,17 +762,18 @@ async function resolveTheoremUses({ leaRepoPath, overleafProjectId, theoremUses,
       jobs
     });
 
-    if (status.status !== "formalized" || !status.absolutePath || !status.declarationName) {
+    const equivalentStatus = getEquivalentTheoremStatus(status);
+    if (!["formalized", "sorry_stub"].includes(equivalentStatus.status) || !equivalentStatus.absolutePath || !equivalentStatus.declarationName) {
       unresolvedUses.push(theoremLabel);
       continue;
     }
 
     resolvedUses.push({
       theoremLabel,
-      declarationName: status.declarationName,
-      relativePath: status.recordedProofPath || status.relativePath || "",
-      absolutePath: status.absolutePath,
-      moduleName: status.moduleName || null
+      declarationName: equivalentStatus.declarationName,
+      relativePath: equivalentStatus.recordedProofPath || equivalentStatus.relativePath || "",
+      absolutePath: equivalentStatus.absolutePath,
+      moduleName: equivalentStatus.moduleName || null
     });
   }
 
@@ -2096,10 +2098,12 @@ async function getTheoremStatus({
   }
 
   if (failedJob) {
-    return {
-      ...buildJobResponse({ job: failedJob, status: "failed", target }),
+    return buildFailedTheoremStatus({
+      failedJob,
+      target,
+      equivalentStatus: mappedStatus || projectStatus || directProofStatus,
       logTail: await readLogTail(failedJob.logPath)
-    };
+    });
   }
 
   if (mappedStatus) {
@@ -2122,6 +2126,38 @@ async function getTheoremStatus({
     projectId: target.projectId,
     projectSlug: target.projectSlug,
     projectMarkdownPath: target.projectMarkdownPath
+  };
+}
+
+function buildFailedTheoremStatus({ failedJob, target, equivalentStatus, logTail = "" }) {
+  const fallback = buildJobResponse({ job: failedJob, status: "failed", target });
+  const effectiveStatus = failedJob.finalStatus === "sorry_stub" && failedJob.declarationName && failedJob.recordedProofPath
+    ? "sorry_stub"
+    : equivalentStatus?.status === "sorry_stub"
+      ? "sorry_stub"
+      : "unformalized";
+  const base = effectiveStatus === "sorry_stub" && equivalentStatus?.status === "sorry_stub"
+    ? { ...fallback, ...equivalentStatus }
+    : fallback;
+
+  return {
+    ...base,
+    status: "failed",
+    effectiveStatus,
+    jobId: failedJob.jobId,
+    logTail,
+    startedAt: failedJob.startedAt,
+    finishedAt: failedJob.finishedAt
+  };
+}
+
+function getEquivalentTheoremStatus(status) {
+  if (status?.status !== "failed") {
+    return status || { status: "unformalized" };
+  }
+  return {
+    ...status,
+    status: status.effectiveStatus || "unformalized"
   };
 }
 

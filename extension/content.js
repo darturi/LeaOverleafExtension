@@ -99,8 +99,9 @@
     const status = popover.querySelector(".ol-lean-popover-status");
     const leanStatement = popover.querySelector(".ol-lean-popover-lean");
     const currentStatus = latestStatuses[theorem.label]?.status || "unknown";
+    const actionStatus = getActionStatus(latestStatuses[theorem.label]);
     renderLeanStatement(leanStatement, latestStatuses[theorem.label]?.leanStatement || "");
-    renderTheoremActions(actions, theorem, currentStatus, status, leanStatement);
+    renderTheoremActions(actions, theorem, currentStatus, status, leanStatement, actionStatus);
     if (currentStatus === "in_progress") {
       status.textContent = inProgressMessage(latestStatuses[theorem.label]);
     } else if (isExtensionContextInvalidated()) {
@@ -112,10 +113,10 @@
     activePopover = popover;
   }
 
-  function renderTheoremActions(actions, theorem, currentStatus, status, leanStatement) {
+  function renderTheoremActions(actions, theorem, currentStatus, status, leanStatement, actionStatus = currentStatus) {
     actions.replaceChildren();
     const disabled = currentStatus === "in_progress" || isExtensionContextInvalidated();
-    const actionSpecs = actionSpecsForStatus(currentStatus);
+    const actionSpecs = actionSpecsForStatus(actionStatus);
     for (const spec of actionSpecs) {
       const button = document.createElement("button");
       button.type = "button";
@@ -137,7 +138,8 @@
           await refreshStatusesNow();
         } catch (error) {
           status.textContent = error instanceof Error ? error.message : String(error);
-          renderTheoremActions(actions, theorem, latestStatuses[theorem.label]?.status || currentStatus, status, leanStatement);
+          const latestStatus = latestStatuses[theorem.label] || { status: currentStatus };
+          renderTheoremActions(actions, theorem, latestStatus.status || currentStatus, status, leanStatement, getActionStatus(latestStatus));
         }
       });
       actions.appendChild(button);
@@ -360,6 +362,7 @@
     if (!popover || popover.dataset.theoremLabel !== theorem.label) return;
     const statusInfo = latestStatuses[theorem.label] || { status: "unknown" };
     const currentStatus = statusInfo.status || "unknown";
+    const actionStatus = getActionStatus(statusInfo);
     const chip = popover.querySelector(".ol-lean-status-chip");
     const detail = popover.querySelector(".ol-lean-popover-detail");
     const actions = popover.querySelector("[data-role='theorem-actions']");
@@ -370,7 +373,7 @@
       chip.textContent = formatStatus(currentStatus);
     }
     if (actions) {
-      renderTheoremActions(actions, theorem, currentStatus, popover.querySelector(".ol-lean-popover-status"), leanStatement);
+      renderTheoremActions(actions, theorem, currentStatus, popover.querySelector(".ol-lean-popover-status"), leanStatement, actionStatus);
     }
 
     if (detail) {
@@ -622,6 +625,13 @@
       default:
         return "Run Lea";
     }
+  }
+
+  function getActionStatus(statusInfo) {
+    if (statusInfo?.status === "failed") {
+      return statusInfo.effectiveStatus || "unformalized";
+    }
+    return statusInfo?.status || "unknown";
   }
 
   function getSettings() {
