@@ -88,52 +88,111 @@
     popover.innerHTML = `
       <p class="ol-lean-popover-title">Lean formalization</p>
       <p class="ol-lean-popover-meta">Label: <strong></strong></p>
-      <div class="ol-lean-popover-actions">
-        <button type="button" data-primary="true">Confirm</button>
-        <button type="button">Close</button>
-      </div>
+      <div class="ol-lean-popover-actions" data-role="theorem-actions"></div>
       <pre class="ol-lean-popover-lean" hidden></pre>
       <p class="ol-lean-popover-status"></p>
     `;
 
+    popover.dataset.theoremLabel = theorem.label;
     popover.querySelector("strong").textContent = theorem.label;
-    const confirmButton = popover.querySelector("button[data-primary='true']");
-    const closeButton = popover.querySelector("button:not([data-primary])");
+    const actions = popover.querySelector("[data-role='theorem-actions']");
     const status = popover.querySelector(".ol-lean-popover-status");
     const leanStatement = popover.querySelector(".ol-lean-popover-lean");
     const currentStatus = latestStatuses[theorem.label]?.status || "unknown";
     renderLeanStatement(leanStatement, latestStatuses[theorem.label]?.leanStatement || "");
-    confirmButton.textContent = buttonTextForStatus(currentStatus);
-    confirmButton.disabled = currentStatus === "in_progress" || isExtensionContextInvalidated();
+    renderTheoremActions(actions, theorem, currentStatus, status, leanStatement);
     if (currentStatus === "in_progress") {
       status.textContent = inProgressMessage(latestStatuses[theorem.label]);
     } else if (isExtensionContextInvalidated()) {
       status.textContent = "Extension was reloaded. Refresh this Overleaf tab.";
     }
 
-    confirmButton.addEventListener("click", async () => {
-      confirmButton.disabled = true;
-      status.textContent = currentStatus === "formalized" || currentStatus === "unknown"
-        ? "Checking Lea status..."
-        : "Starting Lea...";
-      try {
-        const result = currentStatus === "formalized" || currentStatus === "unknown"
-          ? await refreshSingleStatus(theorem)
-          : await formalize(theorem);
-        status.textContent = `${formatStatus(result.status)}${result.relativePath ? ` at ${result.relativePath}` : ""}`;
-        renderLeanStatement(leanStatement, result.leanStatement || latestStatuses[theorem.label]?.leanStatement || "");
-        await refreshStatusesNow();
-      } catch (error) {
-        status.textContent = error instanceof Error ? error.message : String(error);
-        confirmButton.disabled = false;
-      }
-    });
-
-    closeButton.addEventListener("click", closePopover);
-
     document.body.appendChild(popover);
     positionPopover(popover, clientX, clientY);
     activePopover = popover;
+  }
+
+  function renderTheoremActions(actions, theorem, currentStatus, status, leanStatement) {
+    actions.replaceChildren();
+    const disabled = currentStatus === "in_progress" || isExtensionContextInvalidated();
+    const actionSpecs = actionSpecsForStatus(currentStatus);
+    for (const spec of actionSpecs) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = spec.label;
+      button.dataset.role = spec.role;
+      if (spec.primary) {
+        button.dataset.primary = "true";
+      }
+      button.disabled = disabled;
+      button.addEventListener("click", async () => {
+        for (const actionButton of actions.querySelectorAll("button")) {
+          actionButton.disabled = true;
+        }
+        status.textContent = spec.pendingText;
+        try {
+          const result = await spec.run(theorem);
+          status.textContent = `${formatStatus(result.status)}${result.relativePath ? ` at ${result.relativePath}` : ""}`;
+          renderLeanStatement(leanStatement, result.leanStatement || latestStatuses[theorem.label]?.leanStatement || "");
+          await refreshStatusesNow();
+        } catch (error) {
+          status.textContent = error instanceof Error ? error.message : String(error);
+          renderTheoremActions(actions, theorem, latestStatuses[theorem.label]?.status || currentStatus, status, leanStatement);
+        }
+      });
+      actions.appendChild(button);
+    }
+
+    const closeButton = document.createElement("button");
+    closeButton.type = "button";
+    closeButton.textContent = "Close";
+    closeButton.addEventListener("click", closePopover);
+    actions.appendChild(closeButton);
+  }
+
+  function actionSpecsForStatus(status) {
+    if (status === "unformalized") {
+      return [
+        {
+          role: "theorem-stub",
+          label: "Stub",
+          pendingText: "Asking Lea for a sorry stub...",
+          run: stub
+        },
+        {
+          role: "theorem-action",
+          label: "Formalize",
+          primary: true,
+          pendingText: "Starting Lea...",
+          run: formalize
+        }
+      ];
+    }
+    if (status === "sorry_stub") {
+      return [{
+        role: "theorem-action",
+        label: "Formalize",
+        primary: true,
+        pendingText: "Approving Lea stub and starting proof search...",
+        run: formalize
+      }];
+    }
+    if (status === "formalized" || status === "unknown") {
+      return [{
+        role: "theorem-action",
+        label: "Check status",
+        primary: true,
+        pendingText: "Checking Lea status...",
+        run: refreshSingleStatus
+      }];
+    }
+    return [{
+      role: "theorem-action",
+      label: buttonTextForStatus(status),
+      primary: true,
+      pendingText: "Starting Lea...",
+      run: formalize
+    }];
   }
 
   function showSettingsPopover() {
@@ -303,24 +362,29 @@
     const currentStatus = statusInfo.status || "unknown";
     const chip = popover.querySelector(".ol-lean-status-chip");
     const detail = popover.querySelector(".ol-lean-popover-detail");
-    const actionButton = popover.querySelector("[data-role='theorem-action']");
+    const actions = popover.querySelector("[data-role='theorem-actions']");
     const leanStatement = popover.querySelector(".ol-lean-popover-lean");
 
-    chip.className = `ol-lean-status-chip ol-lean-status-chip-${currentStatus}`;
-    chip.textContent = formatStatus(currentStatus);
-    actionButton.textContent = buttonTextForStatus(currentStatus);
-    actionButton.disabled = currentStatus === "in_progress" || isExtensionContextInvalidated();
+    if (chip) {
+      chip.className = `ol-lean-status-chip ol-lean-status-chip-${currentStatus}`;
+      chip.textContent = formatStatus(currentStatus);
+    }
+    if (actions) {
+      renderTheoremActions(actions, theorem, currentStatus, popover.querySelector(".ol-lean-popover-status"), leanStatement);
+    }
 
-    if (isExtensionContextInvalidated()) {
-      detail.textContent = "Extension was reloaded. Refresh this Overleaf tab.";
-    } else if (statusInfo.message) {
-      detail.textContent = statusInfo.message;
-    } else if (statusInfo.relativePath) {
-      detail.textContent = statusInfo.relativePath;
-    } else if (currentStatus === "in_progress") {
-      detail.textContent = inProgressMessage(statusInfo);
-    } else {
-      detail.textContent = "Ready to send this theorem to Lea.";
+    if (detail) {
+      if (isExtensionContextInvalidated()) {
+        detail.textContent = "Extension was reloaded. Refresh this Overleaf tab.";
+      } else if (statusInfo.message) {
+        detail.textContent = statusInfo.message;
+      } else if (statusInfo.relativePath) {
+        detail.textContent = statusInfo.relativePath;
+      } else if (currentStatus === "in_progress") {
+        detail.textContent = inProgressMessage(statusInfo);
+      } else {
+        detail.textContent = "Ready to send this theorem to Lea.";
+      }
     }
     renderLeanStatement(leanStatement, statusInfo.leanStatement || "");
   }
@@ -329,6 +393,29 @@
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
     const response = await fetch(`${baseUrl}/formalize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        overleafProjectId: extractOverleafProjectId(),
+        theoremLabel: theorem.label,
+        theoremText: theorem.text,
+        theoremUses: theorem.uses || [],
+        theoremContext: theorem.context || "",
+        sourceHash: await sha256(normalizeTheoremText(theorem.text))
+      })
+    });
+
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+    }
+    return payload;
+  }
+
+  async function stub(theorem) {
+    const settings = await getSettings();
+    const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+    const response = await fetch(`${baseUrl}/stub`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

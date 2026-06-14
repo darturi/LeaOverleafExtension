@@ -10,6 +10,7 @@ import {
   handleFormalize,
   handleGetStatuses,
   handleGetUsage,
+  handleStub,
   handleUpdateLeaSettings,
   recoverInterruptedJobs,
   validateLeaRepo
@@ -505,6 +506,155 @@ test("formalize returns active job instead of starting a duplicate", async () =>
   assert.equal(second.body.status, "in_progress");
   assert.equal(second.body.jobId, first.body.jobId);
   assert.equal(calls.filter((call) => call.url.endsWith("/v1/runs")).length, 1);
+});
+
+test("stub starts Lea in theorem translation approval mode and records a sorry stub", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls, {
+      approval: {
+        leanCode: "import Mathlib\n\ntheorem generated_stub_test : True := by sorry",
+        theoremName: "generated_stub_test"
+      }
+    })
+  });
+
+  const result = await handleStub({
+    overleafProjectId: "project-1",
+    theoremLabel: "stub_label",
+    theoremText: "A theorem."
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.status, "sorry_stub");
+  assert.equal(result.body.declarationName, "generated_stub_test");
+  assert.equal(calls[0].url, "http://127.0.0.1:8000/v1/runs");
+  assert.equal(calls[0].body.config.agent.permission_tier, "theorem_translation");
+  assert.equal(calls[0].body.config.model.model_kwargs.api_key, "test-key");
+  const job = state.jobs[result.body.jobId];
+  assert.equal(job.status, "sorry_stub");
+  assert.equal(job.apiRunId, "api-run-1");
+  assert.equal(job.approvalId, "ap_1");
+  assert.equal(
+    await fs.readFile(path.join(leaRepo, job.recordedProofPath), "utf8"),
+    "import Mathlib\n\ntheorem generated_stub_test : True := by sorry\n"
+  );
+  assert.match(
+    await fs.readFile(path.join(leaRepo, "workspace", "projects", "project-1.md"), "utf8"),
+    /<!-- lea:theorem name="generated_stub_test" proof="workspace\/proofs\/Lea\/Project1\/generated_stub_test\.lean" module="Lea\.Project1\.generated_stub_test" -->/
+  );
+});
+
+test("statuses report saved sorry stubs", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "SavedStub.lean");
+  await writeLeaProjectProof(
+    leaRepo,
+    proofPath,
+    "theorem saved_stub_test : True := by\n  sorry\n"
+  );
+  await writeLeaProjectMarkdown(leaRepo, "project-1", {
+    theoremName: "saved_stub_test",
+    proofPath
+  });
+
+  const result = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    theorems: [{ theoremLabel: "saved_stub_test", theoremText: "A theorem." }]
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.statuses.saved_stub_test.status, "sorry_stub");
+  assert.equal(result.body.statuses.saved_stub_test.leanStatement, "theorem saved_stub_test : True");
+});
+
+test("formalize after stub accepts the saved Lea approval and completes proof search", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "generated_stub_test.lean");
+  const restorePath = await installFakeLake();
+  try {
+    const state = await makeState({
+      leaRepoPath: leaRepo,
+      env: { OPENAI_API_KEY: "test-key" },
+      fetchImpl: makeLeaApiFetch(calls, {
+        approval: {
+          leanCode: "import Mathlib\n\ntheorem generated_stub_test : True := by sorry",
+          theoremName: "generated_stub_test"
+        },
+        statusBody: { run_id: "api-run-1", status: "completed", result: { reason: "success" } },
+        onStatusRequest: async () => {
+          await writeLeaProjectProof(
+            leaRepo,
+            proofPath,
+            "theorem generated_stub_test : True := by\n  trivial\n"
+          );
+          await writeLeaProjectMarkdown(leaRepo, "project-1", {
+            theoremName: "generated_stub_test",
+            proofPath,
+            moduleName: "Lea.Project1.generated_stub_test"
+          });
+        }
+      })
+    });
+
+    const stubResult = await handleStub({
+      overleafProjectId: "project-1",
+      theoremLabel: "stub_label",
+      theoremText: "A theorem."
+    }, state);
+    const formalizeResult = await handleFormalize({
+      overleafProjectId: "project-1",
+      theoremLabel: "stub_label",
+      theoremText: "A theorem."
+    }, state);
+
+    assert.equal(stubResult.statusCode, 200);
+    assert.equal(formalizeResult.statusCode, 200);
+    assert.equal(formalizeResult.body.status, "in_progress");
+    await waitFor(() => state.jobs[stubResult.body.jobId]?.status === "formalized");
+    assert.ok(calls.some((call) => String(call.url).endsWith("/v1/runs/api-run-1/approvals/ap_1")));
+    assert.equal(state.jobs[stubResult.body.jobId].declarationName, "generated_stub_test");
+    assert.equal(state.jobs[stubResult.body.jobId].recordedProofPath, proofPath);
+  } finally {
+    restorePath();
+  }
+});
+
+test("stub rejects missing provider keys and non-unformalized theorems", async () => {
+  const leaRepo = await makeLeaRepo();
+  const missingKeyState = await makeState({ leaRepoPath: leaRepo, env: {} });
+  const missingKey = await handleStub({
+    overleafProjectId: "project-1",
+    theoremLabel: "missing_key_stub",
+    theoremText: "A theorem."
+  }, missingKeyState);
+  assert.equal(missingKey.statusCode, 400);
+  assert.equal(missingKey.body.error, "missing_openai_key");
+
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "Already.lean");
+  await writeLeaProjectProof(leaRepo, proofPath, "theorem already_formalized : True := by\n  trivial\n");
+  await writeLeaProjectMarkdown(leaRepo, "project-1", {
+    theoremName: "already_formalized",
+    proofPath
+  });
+  const formalizedState = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch([])
+  });
+  const formalized = await handleStub({
+    overleafProjectId: "project-1",
+    theoremLabel: "already_formalized",
+    theoremText: "A theorem."
+  }, formalizedState);
+
+  assert.equal(formalized.statusCode, 409);
+  assert.equal(formalized.body.error, "not_unformalized");
 });
 
 test("statuses report active Lea jobs as in progress", async () => {
@@ -1249,7 +1399,7 @@ test("statuses are unformalized when project markdown points to a missing proof 
   assert.match(status.message, /proof file is missing/);
 });
 
-test("statuses are in progress when project proof still contains sorry", async () => {
+test("statuses are sorry_stub when project proof still contains sorry", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
   const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "Sorry.lean");
@@ -1269,7 +1419,7 @@ test("statuses are in progress when project proof still contains sorry", async (
   }, state);
 
   assert.equal(result.statusCode, 200);
-  assert.equal(result.body.statuses.project_sorry_test.status, "in_progress");
+  assert.equal(result.body.statuses.project_sorry_test.status, "sorry_stub");
 });
 
 test("statuses report formalized direct proof files without project markdown", async () => {
@@ -1591,6 +1741,7 @@ async function fileExists(filePath) {
 
 function makeLeaApiFetch(calls, options = {}) {
   let statusRequestHandled = false;
+  let approvalAccepted = false;
   return async (url, requestOptions = {}) => {
     const body = requestOptions.body ? JSON.parse(requestOptions.body) : null;
     calls.push({ url, options: requestOptions, body });
@@ -1599,6 +1750,25 @@ function makeLeaApiFetch(calls, options = {}) {
     }
     if (String(url).endsWith("/events")) {
       return sseResponse(200, options.eventFrames || []);
+    }
+    if (String(url).includes("/approvals/")) {
+      approvalAccepted = true;
+      return jsonResponse(200, { run_id: "api-run-1", approval_id: "ap_1", decision: "accept", status: "running" });
+    }
+    if (options.approval && !approvalAccepted) {
+      return jsonResponse(200, {
+        run_id: "api-run-1",
+        status: "paused",
+        pending_approval: {
+          type: "approval_requested",
+          approval_id: "ap_1",
+          tier: "theorem_translation",
+          candidate: 1,
+          lean_code: options.approval.leanCode,
+          theorem_name: options.approval.theoremName,
+          check_result: options.approval.checkResult || "warning: declaration uses 'sorry'"
+        }
+      });
     }
     if (!statusRequestHandled && options.onStatusRequest) {
       statusRequestHandled = true;

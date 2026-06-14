@@ -165,6 +165,17 @@ export async function handleFormalize(payload, state) {
     };
   }
 
+  const resumed = await maybeResumeStubFormalization({
+    state,
+    target,
+    theoremText,
+    theoremContext,
+    theoremUses
+  });
+  if (resumed) {
+    return resumed;
+  }
+
   const usesResolution = await resolveTheoremUses({
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
@@ -197,6 +208,72 @@ export async function handleFormalize(payload, state) {
   return {
     statusCode: 200,
     body: buildJobResponse({ job, status: "in_progress", target })
+  };
+}
+
+export async function handleStub(payload, state) {
+  const validation = validateLeaPayload(payload);
+  if (!validation.ok) {
+    return errorResponse(400, validation.error, validation.message);
+  }
+
+  const { overleafProjectId, theoremLabel, theoremText, theoremContext } = validation;
+  const expectedHash = hashTheoremText(theoremText);
+  if (payload.sourceHash && payload.sourceHash !== expectedHash) {
+    return errorResponse(400, "source_hash_mismatch", "sourceHash does not match theoremText.");
+  }
+
+  const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
+  if (!leaValidation.ok) {
+    return errorResponse(400, leaValidation.error, leaValidation.message);
+  }
+
+  const target = buildLeaTarget({
+    leaRepoPath: state.settings.leaRepoPath,
+    overleafProjectId,
+    theoremLabel
+  });
+  const activeJob = findActiveJob(state.jobs || {}, target.jobKey);
+  if (activeJob) {
+    return errorResponse(409, "job_in_progress", "Lea is already working on this theorem.");
+  }
+
+  const currentStatus = await getTheoremStatus({
+    leaRepoPath: state.settings.leaRepoPath,
+    overleafProjectId,
+    theoremLabel,
+    jobs: state.jobs || {}
+  });
+  if (currentStatus.status !== "unformalized") {
+    return errorResponse(409, "not_unformalized", "Stub is only available for unformalized theorems.");
+  }
+
+  const cleanup = await cleanupPreviousRunArtifacts({
+    leaRepoPath: state.settings.leaRepoPath,
+    target,
+    theoremText,
+    jobs: state.jobs || {}
+  });
+  const job = await createLeaJob({ state, target, theoremText, theoremContext });
+  job.kind = "stub";
+  job.retryCleanup = cleanup;
+  state.jobs[job.jobId] = job;
+  await writeJson(state.jobsPath, state.jobs);
+
+  try {
+    await createStubJob({ state, job, target, theoremText, theoremContext });
+  } catch (error) {
+    job.status = "failed";
+    job.error = error instanceof Error ? error.message : String(error);
+    job.finishedAt = new Date().toISOString();
+    await appendLog(job.logPath, `\n[backend] ${job.error}\n`);
+    await writeJson(state.jobsPath, state.jobs);
+    return errorResponse(500, "stub_failed", job.error);
+  }
+
+  return {
+    statusCode: 200,
+    body: buildJobResponse({ job, status: "sorry_stub", target })
   };
 }
 
@@ -362,6 +439,12 @@ async function routeRequest(request, response, state) {
 
   if (request.method === "POST" && url.pathname === "/formalize") {
     const result = await handleFormalize(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/stub") {
+    const result = await handleStub(await readBodyJson(request), state);
     sendJson(response, result.statusCode, result.body);
     return;
   }
@@ -655,6 +738,17 @@ function findLatestFinishedJob(jobs, jobKey) {
     .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))[0] || null;
 }
 
+function findLatestStubJob(jobs, jobKey) {
+  return Object.values(jobs || {})
+    .filter((job) => (
+      job.jobKey === jobKey &&
+      job.status === "sorry_stub" &&
+      job.declarationName &&
+      job.recordedProofPath
+    ))
+    .sort((a, b) => String(b.finishedAt || b.startedAt).localeCompare(String(a.finishedAt || a.startedAt)))[0] || null;
+}
+
 async function resolveTheoremUses({ leaRepoPath, overleafProjectId, theoremUses, jobs }) {
   const resolvedUses = [];
   const unresolvedUses = [];
@@ -923,13 +1017,28 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
         theoremLabel: target.theoremLabel,
         jobs: {}
       });
-  let proofComplete = status.status === "formalized";
-  if (proofComplete && status.absolutePath) {
-    job.leanCheck = await runLeanCheck(job.leaWorkspacePath, status.absolutePath);
+  const effectiveStatus = (
+    status.status === "unformalized" &&
+    job.declarationName &&
+    job.recordedProofPath
+  )
+    ? await getLeaProofStatusFromEntry({
+      leaRepoPath: state.settings.leaRepoPath,
+      target,
+      entry: {
+        name: job.declarationName,
+        proofPath: job.recordedProofPath,
+        moduleName: job.moduleName || null
+      }
+    })
+    : status;
+  let proofComplete = effectiveStatus.status === "formalized";
+  if (proofComplete && effectiveStatus.absolutePath) {
+    job.leanCheck = await runLeanCheck(job.leaWorkspacePath, effectiveStatus.absolutePath);
     proofComplete = job.leanCheck.ok;
   }
   const nextJobStatus = exit.ok && proofComplete ? "formalized" : "failed";
-  job.finalStatus = status.status;
+  job.finalStatus = effectiveStatus.status;
   job.apiRunId = exit.apiRunId || null;
   job.exitCode = nextJobStatus === "formalized" ? 0 : 1;
   job.timedOut = exit.timedOut;
@@ -937,13 +1046,255 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
     job.error = exit.error ||
       artifact?.error ||
       job.leanCheck?.message ||
-      `Lea API run completed but final status is ${status.status}.`;
+      `Lea API run completed but final status is ${effectiveStatus.status}.`;
   }
   job.finishedAt = new Date().toISOString();
   const exitSummary = exit.timedOut
     ? `Lea timed out after ${job.leaJobTimeoutSeconds} seconds`
     : `Lea API run ${exit.ok ? "completed" : "failed"}`;
-  await appendLog(job.logPath, `\n[backend] ${exitSummary}; final status ${status.status}\n`);
+  await appendLog(job.logPath, `\n[backend] ${exitSummary}; final status ${effectiveStatus.status}\n`);
+  if (job.error) {
+    await appendLog(job.logPath, `[backend] ${job.error}\n`);
+  }
+  job.status = nextJobStatus;
+  await writeJson(state.jobsPath, state.jobs);
+}
+
+async function maybeResumeStubFormalization({ state, target, theoremText, theoremContext = "", theoremUses = [] }) {
+  const stubJob = findLatestStubJob(state.jobs || {}, target.jobKey);
+  if (!stubJob?.apiRunId || !stubJob?.approvalId) {
+    return null;
+  }
+
+  const run = await getLeaApiRun({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl: stubJob.leaApiBaseUrl || state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
+    apiKey: state.env?.LEA_API_KEY,
+    apiRunId: stubJob.apiRunId
+  });
+  const runStatus = String(run.body?.status || run.body?.state || "").toLowerCase();
+  const pendingApprovalId = run.body?.pending_approval?.approval_id;
+  if (!run.ok || runStatus !== "paused" || pendingApprovalId !== stubJob.approvalId) {
+    return null;
+  }
+
+  const usesResolution = await resolveTheoremUses({
+    leaRepoPath: state.settings.leaRepoPath,
+    overleafProjectId: target.overleafProjectId,
+    theoremUses,
+    jobs: state.jobs || {}
+  });
+  if (!usesResolution.ok) {
+    return errorResponse(400, usesResolution.error, usesResolution.message);
+  }
+
+  stubJob.status = "in_progress";
+  stubJob.kind = "formalize_after_stub";
+  stubJob.theoremContext = theoremContext;
+  stubJob.theoremUses = usesResolution.resolvedUses;
+  stubJob.theoremTextHash = hashTheoremText(theoremText);
+  stubJob.startedAt = new Date().toISOString();
+  stubJob.finishedAt = null;
+  stubJob.error = null;
+  stubJob.exitCode = null;
+  await writeJson(state.jobsPath, state.jobs);
+
+  runLeaJobFromApproval({ state, job: stubJob, target }).catch(async (error) => {
+    stubJob.status = "failed";
+    stubJob.error = error instanceof Error ? error.message : String(error);
+    stubJob.finishedAt = new Date().toISOString();
+    await appendLog(stubJob.logPath, `\n[backend] ${stubJob.error}\n`);
+    await writeJson(state.jobsPath, state.jobs);
+  });
+
+  return {
+    statusCode: 200,
+    body: buildJobResponse({ job: stubJob, status: "in_progress", target })
+  };
+}
+
+async function createStubJob({ state, job, target, theoremText, theoremContext = "" }) {
+  const prompt = buildLeaPrompt({
+    projectSlug: target.projectSlug,
+    theoremLabel: target.theoremLabel,
+    theoremText,
+    theoremContext,
+    declarationNameHint: job.declarationNameHint || "",
+    resolvedUses: []
+  });
+  await appendLog(job.logPath, `$ POST ${job.leaApiBaseUrl}/v1/runs (theorem translation approval)\n\n${prompt}\n\n`);
+  const pause = await runLeaApiApprovalStubJob({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl: job.leaApiBaseUrl,
+    apiKey: state.env?.LEA_API_KEY,
+    model: job.leaModel,
+    maxTurns: job.leaMaxTurns,
+    providerApiKey: getProviderApiKey(state, job.leaProviderFamily),
+    prompt,
+    project: {
+      project_id: target.projectSlug,
+      project_path: target.relativePath,
+      record_on_success: true
+    },
+    logPath: job.logPath,
+    timeoutMs: job.leaJobTimeoutSeconds * 1000,
+    onUsageUpdated: async (usage) => {
+      if (usage.delta) {
+        recordJobUsageDelta(job, usage);
+      } else {
+        recordJobUsageSnapshot(job, usage);
+      }
+      await writeJson(state.jobsPath, state.jobs);
+    },
+    onProgressUpdated: async (progress) => {
+      if (!recordJobTurnProgress(job, progress)) return;
+      await writeJson(state.jobsPath, state.jobs);
+    }
+  });
+
+  if (!pause.ok) {
+    throw new Error(pause.error || "Lea did not produce a theorem-translation approval.");
+  }
+
+  recordJobUsage(job, pause);
+  const entry = await persistStubApproval({
+    leaRepoPath: state.settings.leaRepoPath,
+    target,
+    theoremText,
+    theoremContext,
+    approval: pause.approval
+  });
+
+  job.status = "sorry_stub";
+  job.finalStatus = "sorry_stub";
+  job.apiRunId = pause.apiRunId;
+  job.approvalId = pause.approval.approval_id;
+  job.declarationName = entry.name;
+  job.recordedProofPath = entry.proofPath;
+  job.moduleName = entry.moduleName || null;
+  job.approvalLeanCode = pause.approval.lean_code;
+  job.approvalCheckResult = pause.approval.check_result || "";
+  job.finishedAt = new Date().toISOString();
+  job.exitCode = 0;
+  await appendLog(job.logPath, `\n[backend] Stub recorded at ${entry.proofPath}; Lea run paused for approval ${job.approvalId}\n`);
+  await writeJson(state.jobsPath, state.jobs);
+}
+
+async function runLeaJobFromApproval({ state, job, target }) {
+  const beforeMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
+  const resume = await acceptLeaApproval({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl: job.leaApiBaseUrl,
+    apiKey: state.env?.LEA_API_KEY,
+    apiRunId: job.apiRunId,
+    approvalId: job.approvalId
+  });
+  if (!resume.ok) {
+    throw new Error(resume.error || "Could not approve the saved Lea theorem translation.");
+  }
+  await appendLog(job.logPath, `\n[backend] Accepted Lea approval ${job.approvalId}; resuming run ${job.apiRunId}\n`);
+
+  const exit = await waitForLeaApiProofJob({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl: job.leaApiBaseUrl,
+    apiKey: state.env?.LEA_API_KEY,
+    apiRunId: job.apiRunId,
+    maxTurns: job.leaMaxTurns,
+    logPath: job.logPath,
+    timeoutMs: job.leaJobTimeoutSeconds * 1000,
+    onUsageUpdated: async (usage) => {
+      if (usage.delta) {
+        recordJobUsageDelta(job, usage);
+      } else {
+        recordJobUsageSnapshot(job, usage);
+      }
+      await writeJson(state.jobsPath, state.jobs);
+    },
+    onProgressUpdated: async (progress) => {
+      if (!recordJobTurnProgress(job, progress)) return;
+      await writeJson(state.jobsPath, state.jobs);
+    }
+  });
+
+  await finishLeaProofJob({ state, job, target, beforeMarkers, exit });
+}
+
+async function finishLeaProofJob({ state, job, target, beforeMarkers, exit }) {
+  const artifact = exit.ok
+    ? await identifyLeaArtifact({
+      leaRepoPath: state.settings.leaRepoPath,
+      target,
+      beforeMarkers,
+      job
+    })
+    : null;
+
+  if (artifact?.ok) {
+    job.declarationName = artifact.entry.name;
+    job.recordedProofPath = artifact.entry.proofPath;
+    job.moduleName = artifact.entry.moduleName || null;
+  }
+  recordJobUsage(job, exit);
+
+  const status = artifact?.ok
+    ? await getLeaProofStatusFromEntry({
+      leaRepoPath: state.settings.leaRepoPath,
+      target,
+      entry: artifact.entry
+    })
+    : artifact?.error
+      ? {
+        status: "unformalized",
+        theoremLabel: target.theoremLabel,
+        declarationName: target.declarationName,
+        relativePath: target.relativePath,
+        absolutePath: target.absolutePath,
+        projectId: target.projectId,
+        projectSlug: target.projectSlug,
+        projectMarkdownPath: target.projectMarkdownPath
+      }
+      : await getTheoremStatus({
+        leaRepoPath: state.settings.leaRepoPath,
+        overleafProjectId: target.overleafProjectId,
+        theoremLabel: target.theoremLabel,
+        jobs: {}
+      });
+  const effectiveStatus = (
+    status.status === "unformalized" &&
+    job.declarationName &&
+    job.recordedProofPath
+  )
+    ? await getLeaProofStatusFromEntry({
+      leaRepoPath: state.settings.leaRepoPath,
+      target,
+      entry: {
+        name: job.declarationName,
+        proofPath: job.recordedProofPath,
+        moduleName: job.moduleName || null
+      }
+    })
+    : status;
+  let proofComplete = effectiveStatus.status === "formalized";
+  if (proofComplete && effectiveStatus.absolutePath) {
+    job.leanCheck = await runLeanCheck(job.leaWorkspacePath, effectiveStatus.absolutePath);
+    proofComplete = job.leanCheck.ok;
+  }
+  const nextJobStatus = exit.ok && proofComplete ? "formalized" : "failed";
+  job.finalStatus = effectiveStatus.status;
+  job.apiRunId = exit.apiRunId || job.apiRunId || null;
+  job.exitCode = nextJobStatus === "formalized" ? 0 : 1;
+  job.timedOut = exit.timedOut;
+  if (nextJobStatus === "failed") {
+    job.error = exit.error ||
+      artifact?.error ||
+      job.leanCheck?.message ||
+      `Lea API run completed but final status is ${effectiveStatus.status}.`;
+  }
+  job.finishedAt = new Date().toISOString();
+  const exitSummary = exit.timedOut
+    ? `Lea timed out after ${job.leaJobTimeoutSeconds} seconds`
+    : `Lea API run ${exit.ok ? "completed" : "failed"}`;
+  await appendLog(job.logPath, `\n[backend] ${exitSummary}; final status ${effectiveStatus.status}\n`);
   if (job.error) {
     await appendLog(job.logPath, `[backend] ${job.error}\n`);
   }
@@ -992,7 +1343,99 @@ async function runLeaApiProofJob({
   onUsageUpdated = null,
   onProgressUpdated = null
 }) {
-  const started = Date.now();
+  const startResponse = await startLeaApiRun({
+    fetchImpl,
+    baseUrl,
+    apiKey,
+    model,
+    maxTurns,
+    providerApiKey,
+    prompt,
+    project,
+    permissionTier: "none"
+  });
+  if (!startResponse.ok) {
+    return { ok: false, timedOut: false, error: startResponse.error };
+  }
+
+  const apiRunId = startResponse.body?.run_id;
+  if (!apiRunId) {
+    return { ok: false, timedOut: false, error: "Lea API did not return a run_id." };
+  }
+  await appendLog(logPath, `[backend] Lea API run started: ${apiRunId}\n`);
+
+  return waitForLeaApiProofJob({
+    fetchImpl,
+    baseUrl,
+    apiKey,
+    apiRunId,
+    maxTurns,
+    logPath,
+    timeoutMs,
+    onUsageUpdated,
+    onProgressUpdated
+  });
+}
+
+async function runLeaApiApprovalStubJob({
+  fetchImpl,
+  baseUrl,
+  apiKey,
+  model,
+  maxTurns,
+  providerApiKey,
+  prompt,
+  project,
+  logPath,
+  timeoutMs,
+  onUsageUpdated = null,
+  onProgressUpdated = null
+}) {
+  const startResponse = await startLeaApiRun({
+    fetchImpl,
+    baseUrl,
+    apiKey,
+    model,
+    maxTurns,
+    providerApiKey,
+    prompt,
+    project,
+    permissionTier: "theorem_translation"
+  });
+  if (!startResponse.ok) {
+    return { ok: false, timedOut: false, error: startResponse.error };
+  }
+
+  const apiRunId = startResponse.body?.run_id;
+  if (!apiRunId) {
+    return { ok: false, timedOut: false, error: "Lea API did not return a run_id." };
+  }
+  await appendLog(logPath, `[backend] Lea API theorem-translation run started: ${apiRunId}\n`);
+
+  return waitForLeaApiApprovalPause({
+    fetchImpl,
+    baseUrl,
+    apiKey,
+    apiRunId,
+    maxTurns,
+    logPath,
+    timeoutMs,
+    onUsageUpdated,
+    onProgressUpdated
+  });
+}
+
+async function startLeaApiRun({
+  fetchImpl,
+  baseUrl,
+  apiKey,
+  model,
+  maxTurns,
+  providerApiKey,
+  prompt,
+  project,
+  permissionTier
+}) {
   const headers = { "Content-Type": "application/json" };
   if (apiKey) {
     headers.Authorization = `Bearer ${apiKey}`;
@@ -1010,27 +1453,33 @@ async function runLeaApiProofJob({
       agent: {
         max_turns: maxTurns,
         narrate_tool_steps: false,
-        permission_tier: "none",
+        permission_tier: permissionTier,
         theorem_translation_max_retries: 3
       }
     },
     project
   };
 
-  const startResponse = await fetchJson(fetchImpl, `${baseUrl}/v1/runs`, {
+  return fetchJson(fetchImpl, `${baseUrl}/v1/runs`, {
     method: "POST",
     headers,
     body: JSON.stringify(body)
   });
-  if (!startResponse.ok) {
-    return { ok: false, timedOut: false, error: startResponse.error };
-  }
+}
 
-  const apiRunId = startResponse.body?.run_id;
-  if (!apiRunId) {
-    return { ok: false, timedOut: false, error: "Lea API did not return a run_id." };
-  }
-  await appendLog(logPath, `[backend] Lea API run started: ${apiRunId}\n`);
+async function waitForLeaApiProofJob({
+  fetchImpl,
+  baseUrl,
+  apiKey,
+  apiRunId,
+  maxTurns,
+  logPath,
+  timeoutMs,
+  onUsageUpdated = null,
+  onProgressUpdated = null,
+  refTimers = false
+}) {
+  const started = Date.now();
   const usageAbort = new AbortController();
   const eventsPromise = tailLeaRunUsageEvents({
     fetchImpl,
@@ -1045,7 +1494,7 @@ async function runLeaApiProofJob({
   });
 
   while (Date.now() - started < timeoutMs) {
-    await delay(Math.min(1000, Math.max(1, timeoutMs - (Date.now() - started))));
+    await delay(Math.min(1000, Math.max(1, timeoutMs - (Date.now() - started))), { ref: refTimers });
     const statusResponse = await fetchJson(fetchImpl, `${baseUrl}/v1/runs/${encodeURIComponent(apiRunId)}`, {
       method: "GET",
       headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
@@ -1094,6 +1543,104 @@ async function runLeaApiProofJob({
 
   usageAbort.abort();
   return { ok: false, timedOut: true, apiRunId, error: "Lea API run timed out." };
+}
+
+async function waitForLeaApiApprovalPause({
+  fetchImpl,
+  baseUrl,
+  apiKey,
+  apiRunId,
+  maxTurns,
+  logPath,
+  timeoutMs,
+  onUsageUpdated = null,
+  onProgressUpdated = null,
+  refTimers = true
+}) {
+  const started = Date.now();
+  const usageAbort = new AbortController();
+  const eventsPromise = tailLeaRunUsageEvents({
+    fetchImpl,
+    baseUrl,
+    apiKey,
+    apiRunId,
+    logPath,
+    maxTurns,
+    onUsageUpdated,
+    onProgressUpdated,
+    signal: usageAbort.signal
+  });
+
+  while (Date.now() - started < timeoutMs) {
+    await delay(Math.min(1000, Math.max(1, timeoutMs - (Date.now() - started))), { ref: refTimers });
+    const statusResponse = await getLeaApiRun({ fetchImpl, baseUrl, apiKey, apiRunId });
+    if (!statusResponse.ok) {
+      usageAbort.abort();
+      return { ok: false, timedOut: false, apiRunId, error: statusResponse.error };
+    }
+
+    const run = statusResponse.body || {};
+    await notifyTurnProgress(onProgressUpdated, run, maxTurns);
+    const status = String(run.status || run.state || "").toLowerCase();
+    const message = extractRunMessage(run);
+    if (message) {
+      await appendLog(logPath, `[lea-api] ${message}\n`);
+    }
+    if (status === "paused" && run.pending_approval?.type === "approval_requested") {
+      usageAbort.abort();
+      await settleUsageEvents(eventsPromise);
+      return {
+        ok: true,
+        timedOut: false,
+        apiRunId,
+        approval: run.pending_approval,
+        ...extractRunUsage(run)
+      };
+    }
+    if (["completed", "succeeded", "success", "done"].includes(status)) {
+      usageAbort.abort();
+      await settleUsageEvents(eventsPromise);
+      return {
+        ok: false,
+        timedOut: false,
+        apiRunId,
+        error: message || "Lea completed without pausing for theorem approval.",
+        ...extractRunUsage(run)
+      };
+    }
+    if (["failed", "error", "cancelled", "canceled", "timeout", "timed_out"].includes(status)) {
+      usageAbort.abort();
+      await settleUsageEvents(eventsPromise);
+      return {
+        ok: false,
+        timedOut: false,
+        apiRunId,
+        error: message || `Lea API status: ${status}`,
+        ...extractRunUsage(run)
+      };
+    }
+  }
+
+  usageAbort.abort();
+  return { ok: false, timedOut: true, apiRunId, error: "Lea API run timed out waiting for theorem approval." };
+}
+
+function getLeaApiRun({ fetchImpl, baseUrl, apiKey, apiRunId }) {
+  return fetchJson(fetchImpl, `${baseUrl}/v1/runs/${encodeURIComponent(apiRunId)}`, {
+    method: "GET",
+    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
+  });
+}
+
+function acceptLeaApproval({ fetchImpl, baseUrl, apiKey, apiRunId, approvalId }) {
+  return fetchJson(fetchImpl, `${baseUrl}/v1/runs/${encodeURIComponent(apiRunId)}/approvals/${encodeURIComponent(approvalId)}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {})
+    },
+    body: JSON.stringify({ decision: "accept" })
+  });
 }
 
 async function tailLeaRunUsageEvents({
@@ -1454,10 +2001,12 @@ function normalizeLeaApiBaseUrl(value) {
   return text;
 }
 
-function delay(ms) {
+function delay(ms, { ref = true } = {}) {
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, ms);
-    timer.unref?.();
+    if (!ref) {
+      timer.unref?.();
+    }
   });
 }
 
@@ -1520,6 +2069,7 @@ async function getTheoremStatus({
   const projectStatus = await getLeaProjectTheoremStatus({ leaRepoPath, target });
   const directProofStatus = await getLeaDirectProofStatus({ leaRepoPath, target });
   const mappedStatus = await getLatestMappedJobStatus({ leaRepoPath, target, jobs });
+  const failedJob = findLatestJob(jobs, target.jobKey, "failed");
 
   const activeJob = findActiveJob(jobs, target.jobKey);
   if (activeJob) {
@@ -1537,7 +2087,7 @@ async function getTheoremStatus({
     return buildJobResponse({ job: activeJob, status: "in_progress", target });
   }
 
-  if (mappedStatus) {
+  if (mappedStatus?.status === "formalized") {
     return mappedStatus;
   }
 
@@ -1545,12 +2095,15 @@ async function getTheoremStatus({
     return directProofStatus;
   }
 
-  const failedJob = findLatestJob(jobs, target.jobKey, "failed");
   if (failedJob) {
     return {
       ...buildJobResponse({ job: failedJob, status: "failed", target }),
       logTail: await readLogTail(failedJob.logPath)
     };
+  }
+
+  if (mappedStatus) {
+    return mappedStatus;
   }
 
   if (projectStatus) {
@@ -1614,8 +2167,9 @@ async function getLeaProofStatusFromEntry({ leaRepoPath, target, entry }) {
   const content = await fs.readFile(absolutePath, "utf8");
   if (/\bsorry\b|admit\b/.test(content)) {
     return {
-      status: "in_progress",
-      ...responseBase
+      status: "sorry_stub",
+      ...responseBase,
+      leanStatement: extractLeanStatement(content, entry.name)
     };
   }
 
@@ -1653,8 +2207,9 @@ async function getLeaDirectProofStatus({ leaRepoPath, target }) {
 
   if (/\bsorry\b|admit\b/.test(content)) {
     return {
-      status: "in_progress",
-      ...responseBase
+      status: "sorry_stub",
+      ...responseBase,
+      leanStatement: extractLeanStatement(content, declarationName)
     };
   }
 
@@ -1669,7 +2224,7 @@ async function getLatestMappedJobStatus({ leaRepoPath, target, jobs }) {
   const mappedJob = Object.values(jobs || {})
     .filter((job) => (
       job.jobKey === target.jobKey &&
-      job.status === "formalized" &&
+      ["formalized", "sorry_stub"].includes(job.status) &&
       job.declarationName &&
       job.recordedProofPath
     ))
@@ -1755,6 +2310,144 @@ function selectLeaArtifactCandidate({ candidates, job, ambiguousMessage }) {
     ok: false,
     error: `${ambiguousMessage} Candidates: ${candidates.map((entry) => entry.name).join(", ")}.`
   };
+}
+
+async function persistStubApproval({ leaRepoPath, target, theoremText, theoremContext = "", approval }) {
+  const leanCode = String(approval?.lean_code || "").trim();
+  if (!leanCode) {
+    throw new Error("Lea approval did not include Lean code.");
+  }
+  const declarationName = String(approval?.theorem_name || "").trim() ||
+    inferLeanDeclarationName(leanCode) ||
+    inferLeanDeclarationName(theoremText) ||
+    target.theoremLabel;
+  if (!isValidLeanIdentifier(declarationName)) {
+    throw new Error(`Lea approval returned an invalid theorem name: ${declarationName}.`);
+  }
+
+  const proofPath = stubProofPath({ projectSlug: target.projectSlug, declarationName });
+  const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath });
+  if (!absolutePath) {
+    throw new Error("Could not resolve Lea stub proof path.");
+  }
+  await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+  await fs.writeFile(absolutePath, `${leanCode}\n`, "utf8");
+
+  const moduleName = moduleNameFromProofPath(proofPath);
+  await upsertProjectTheoremEntry({
+    projectMarkdownPath: target.projectMarkdownPath,
+    projectId: target.projectSlug,
+    theoremName: declarationName,
+    proofPath,
+    moduleName,
+    signature: extractLeanStatement(leanCode, declarationName) || `${declarationName} := by sorry`,
+    description: theoremText,
+    solvingProcess: [
+      "Stub generated from Lea theorem-translation approval.",
+      theoremContext ? `Formalization guidance: ${theoremContext}` : "",
+      approval.check_result ? `Lean check: ${approval.check_result}` : ""
+    ].filter(Boolean).join("\n\n")
+  });
+
+  return { name: declarationName, proofPath, moduleName };
+}
+
+function stubProofPath({ projectSlug, declarationName }) {
+  const projectPart = projectNamespacePart(projectSlug);
+  return path.join("workspace", "proofs", "Lea", projectPart, `${declarationName}.lean`);
+}
+
+function projectNamespacePart(projectSlug) {
+  const part = String(projectSlug || "Project")
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map((token) => `${token.slice(0, 1).toUpperCase()}${token.slice(1)}`)
+    .join("");
+  const candidate = part || "Project";
+  return /^[A-Za-z_]/.test(candidate) ? candidate : `Project${candidate}`;
+}
+
+function moduleNameFromProofPath(proofPath) {
+  const parts = String(proofPath || "").split(/[\\/]+/);
+  const proofsIndex = parts.indexOf("proofs");
+  if (proofsIndex === -1) return null;
+  const moduleParts = parts.slice(proofsIndex + 1);
+  if (moduleParts.length === 0) return null;
+  moduleParts[moduleParts.length - 1] = moduleParts[moduleParts.length - 1].replace(/\.lean$/, "");
+  return moduleParts.every((part) => /^[A-Za-z_][A-Za-z0-9_']*$/.test(part))
+    ? moduleParts.join(".")
+    : null;
+}
+
+async function upsertProjectTheoremEntry({
+  projectMarkdownPath,
+  projectId,
+  theoremName,
+  proofPath,
+  moduleName,
+  signature,
+  description,
+  solvingProcess
+}) {
+  let existing;
+  try {
+    existing = await fs.readFile(projectMarkdownPath, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    existing = `# Lea Project: ${projectId}\n\n<!-- lea:project id="${escapeHtmlAttribute(projectId)}" -->\n`;
+  }
+  const entry = renderProjectTheoremEntry({
+    theoremName,
+    proofPath,
+    moduleName,
+    signature,
+    description,
+    solvingProcess
+  });
+  const sections = findProjectTheoremSections(existing);
+  const section = sections.find((candidate) => candidate.entry.name === theoremName);
+  const next = section
+    ? `${existing.slice(0, section.start).trimEnd()}\n\n${entry.trimEnd()}\n${existing.slice(section.end).trimStart() ? `\n${existing.slice(section.end).trimStart()}` : ""}`
+    : `${existing.trimEnd()}\n\n${entry.trimEnd()}\n`;
+  await fs.mkdir(path.dirname(projectMarkdownPath), { recursive: true });
+  await fs.writeFile(projectMarkdownPath, next.replace(/\n{3,}/g, "\n\n"), "utf8");
+}
+
+function renderProjectTheoremEntry({
+  theoremName,
+  proofPath,
+  moduleName,
+  signature,
+  description,
+  solvingProcess
+}) {
+  const attrs = [
+    `name="${escapeHtmlAttribute(theoremName)}"`,
+    `proof="${escapeHtmlAttribute(proofPath)}"`,
+    moduleName ? `module="${escapeHtmlAttribute(moduleName)}"` : ""
+  ].filter(Boolean).join(" ");
+  return `## Theorem: ${theoremName}
+
+<!-- lea:theorem ${attrs} -->
+
+### Signature
+
+\`\`\`lean
+${String(signature || "").trim()}
+\`\`\`
+
+### Description
+
+${String(description || "(No description recorded.)").trim()}
+
+### Solving Process
+
+${String(solvingProcess || "(No solving summary recorded.)").trim()}
+
+### Lean Location
+
+\`${proofPath}\`
+`;
 }
 
 async function readProjectTheoremEntries(projectMarkdownPath) {
@@ -1843,6 +2536,15 @@ function parseMarkerAttrs(text) {
     attrs[match[1]] = unescapeHtmlAttribute(match[2]);
   }
   return attrs;
+}
+
+function escapeHtmlAttribute(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 function unescapeHtmlAttribute(value) {
