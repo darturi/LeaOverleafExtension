@@ -12,21 +12,44 @@ This repository contains a local MVP for sending labeled Overleaf theorem blocks
 
 ## Theorem Syntax
 
-The MVP requires labeled theorem blocks:
+The MVP requires theorem blocks with extension metadata in the optional argument:
 
 ```tex
-\theorem{
+\theorem[label=my_theorem_name]{
   Every finite tree has at least two leaves.
-}\label{my_theorem_name}
+}
 ```
 
-The `\label{...}` value is used as the generated Lean declaration name. It must be a valid Lean identifier: letters, digits, and underscores, with no leading digit.
+The `label=...` value is used as the Overleaf theorem identifier and fallback generated Lean declaration name. It must be a valid Lean identifier: letters, digits, and underscores, with no leading digit.
 
-For a minimal test document, define the display macro in the preamble:
+To point Lea at especially helpful prior results, add `uses={...}` with one or more previously formalized Overleaf labels:
 
 ```tex
-\newcommand{\theorem}[1]{\paragraph{Theorem.} #1}
+\theorem[label=my_next_theorem, uses={my_prior_theorem, another_prior_theorem}]{
+  Prove this using earlier project results.
+}
 ```
+
+Each `uses={...}` entry must be a valid label in the same Overleaf project and must already be formalized. The companion resolves those labels to Lea's recorded theorem names and proof files before starting the new run.
+
+To give Lea natural-language formalization tips, add `context={...}`:
+
+```tex
+\theorem[label=my_guided_theorem, context={Use induction on n, then simplify.}]{
+  Prove this with the suggested strategy.
+}
+```
+
+When provided, the context is added to the Lea prompt as formalization guidance. Use braces around context text that contains commas or spans multiple lines, just as with `uses={...}`.
+
+For a minimal test document, define the display macro in the preamble. The optional argument is consumed by the extension and ignored by LaTeX rendering:
+
+```tex
+\usepackage{xparse}
+\NewDocumentCommand{\theorem}{O{} +m}{\paragraph{Theorem.} #2}
+```
+
+If your document already defines `\theorem`, replace `\NewDocumentCommand` with `\RenewDocumentCommand`.
 
 ## One-Time Local Setup
 

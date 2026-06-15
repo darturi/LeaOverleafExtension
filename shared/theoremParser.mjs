@@ -1,8 +1,6 @@
 import { createHash } from "node:crypto";
 
 const THEOREM_PREFIX = "\\theorem";
-const LABEL_PREFIX = "[label=";
-const LATEX_LABEL_PREFIX = "\\label";
 
 export function normalizeTheoremText(text) {
   return String(text).replace(/\s+/g, " ").trim();
@@ -61,16 +59,18 @@ export function parseTheoremAt(source, start) {
   let cursor = start + THEOREM_PREFIX.length;
   cursor = skipWhitespace(source, cursor);
 
-  let label = null;
+  if (source[cursor] !== "[") {
+    return { ok: false, reason: "missing theorem metadata" };
+  }
 
-  if (source.startsWith(LABEL_PREFIX, cursor)) {
-    const labelStart = cursor + LABEL_PREFIX.length;
-    const labelEnd = source.indexOf("]", labelStart);
-    if (labelEnd === -1) {
-      return { ok: false, reason: "unterminated label" };
-    }
-    label = source.slice(labelStart, labelEnd).trim();
-    cursor = skipWhitespace(source, labelEnd + 1);
+  const metadataResult = parseOptionalMetadata(source, cursor);
+  if (!metadataResult.ok) {
+    return metadataResult;
+  }
+  cursor = skipWhitespace(source, metadataResult.end);
+
+  if (!isValidLeanIdentifier(metadataResult.metadata.label || "")) {
+    return { ok: false, reason: "invalid label" };
   }
 
   if (source[cursor] !== "{") {
@@ -91,25 +91,16 @@ export function parseTheoremAt(source, start) {
       depth -= 1;
       if (depth === 0) {
         const bodyEnd = cursor;
-        let theoremEnd = cursor + 1;
-        const labelResult = label
-          ? { ok: true, label, end: theoremEnd }
-          : parseTrailingLatexLabel(source, theoremEnd);
-        if (!labelResult.ok) {
-          return labelResult;
-        }
-        theoremEnd = labelResult.end;
-        if (!isValidLeanIdentifier(labelResult.label)) {
-          return { ok: false, reason: "invalid label" };
-        }
 
         return {
           ok: true,
           theorem: {
-            label: labelResult.label,
+            label: metadataResult.metadata.label,
             text: source.slice(bodyStart, bodyEnd).trim(),
+            uses: metadataResult.metadata.uses,
+            context: metadataResult.metadata.context,
             from: start,
-            to: theoremEnd,
+            to: cursor + 1,
             bodyFrom: bodyStart,
             bodyTo: bodyEnd,
             sourceHash: hashTheoremText(source.slice(bodyStart, bodyEnd))
@@ -124,28 +115,132 @@ export function parseTheoremAt(source, start) {
   return { ok: false, reason: "unterminated theorem body" };
 }
 
-function parseTrailingLatexLabel(source, cursor) {
-  cursor = skipWhitespace(source, cursor);
-  if (!source.startsWith(LATEX_LABEL_PREFIX, cursor)) {
-    return { ok: false, reason: "missing label" };
+function parseOptionalMetadata(source, cursor) {
+  const metadataStart = cursor + 1;
+  let depth = 0;
+  let bracketDepth = 0;
+  cursor = metadataStart;
+
+  while (cursor < source.length) {
+    const char = source[cursor];
+    const previous = source[cursor - 1];
+
+    if (char === "{" && previous !== "\\") {
+      depth += 1;
+    } else if (char === "}" && previous !== "\\") {
+      depth = Math.max(0, depth - 1);
+    } else if (char === "[" && previous !== "\\" && depth === 0) {
+      bracketDepth += 1;
+    } else if (char === "]" && previous !== "\\" && depth === 0 && bracketDepth > 0) {
+      bracketDepth -= 1;
+    } else if (char === "]" && previous !== "\\" && depth === 0) {
+      return {
+        ok: true,
+        metadata: parseMetadata(source.slice(metadataStart, cursor)),
+        end: cursor + 1
+      };
+    }
+
+    cursor += 1;
   }
 
-  cursor = skipWhitespace(source, cursor + LATEX_LABEL_PREFIX.length);
-  if (source[cursor] !== "{") {
-    return { ok: false, reason: "missing label body" };
+  return { ok: false, reason: "unterminated theorem metadata" };
+}
+
+function parseMetadata(source) {
+  const metadata = { label: "", uses: [], context: "" };
+  for (const entry of splitMetadataEntries(source)) {
+    const separator = entry.indexOf("=");
+    if (separator === -1) {
+      continue;
+    }
+    const key = entry.slice(0, separator).trim();
+    const value = unbrace(entry.slice(separator + 1).trim());
+    if (key === "label") {
+      metadata.label = value.trim();
+    } else if (key === "uses") {
+      metadata.uses = splitTopLevel(value, ",")
+        .map((item) => unbrace(item.trim()).trim())
+        .filter(Boolean);
+    } else if (key === "context") {
+      metadata.context = value.trim();
+    }
+  }
+  return metadata;
+}
+
+function splitMetadataEntries(source) {
+  const parts = [];
+  let depth = 0;
+  let bracketDepth = 0;
+  let partStart = 0;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    const previous = source[index - 1];
+    if (char === "{" && previous !== "\\") {
+      depth += 1;
+    } else if (char === "}" && previous !== "\\") {
+      depth = Math.max(0, depth - 1);
+    } else if (char === "[" && previous !== "\\" && depth === 0) {
+      bracketDepth += 1;
+    } else if (char === "]" && previous !== "\\" && depth === 0 && bracketDepth > 0) {
+      bracketDepth -= 1;
+    } else if (isMetadataSeparator(source, index, depth, bracketDepth)) {
+      parts.push(source.slice(partStart, index));
+      partStart = index + 1;
+    }
   }
 
-  const labelStart = cursor + 1;
-  const labelEnd = source.indexOf("}", labelStart);
-  if (labelEnd === -1) {
-    return { ok: false, reason: "unterminated label body" };
+  parts.push(source.slice(partStart));
+  return parts;
+}
+
+function isMetadataSeparator(source, index, depth, bracketDepth) {
+  if (depth !== 0 || bracketDepth !== 0) {
+    return false;
+  }
+  if (source[index] === ",") {
+    return true;
+  }
+  if (source[index] !== "\n") {
+    return false;
+  }
+  return /^(?:\s*)(?:label|uses|context)\s*=/.test(source.slice(index + 1));
+}
+
+function splitTopLevel(source, separator) {
+  const parts = [];
+  let depth = 0;
+  let bracketDepth = 0;
+  let partStart = 0;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    const previous = source[index - 1];
+    if (char === "{" && previous !== "\\") {
+      depth += 1;
+    } else if (char === "}" && previous !== "\\") {
+      depth = Math.max(0, depth - 1);
+    } else if (char === "[" && previous !== "\\" && depth === 0) {
+      bracketDepth += 1;
+    } else if (char === "]" && previous !== "\\" && depth === 0 && bracketDepth > 0) {
+      bracketDepth -= 1;
+    } else if (char === separator && depth === 0 && bracketDepth === 0) {
+      parts.push(source.slice(partStart, index));
+      partStart = index + 1;
+    }
   }
 
-  return {
-    ok: true,
-    label: source.slice(labelStart, labelEnd).trim(),
-    end: labelEnd + 1
-  };
+  parts.push(source.slice(partStart));
+  return parts;
+}
+
+function unbrace(value) {
+  if (value.startsWith("{") && value.endsWith("}")) {
+    return value.slice(1, -1);
+  }
+  return value;
 }
 
 function skipWhitespace(source, cursor) {

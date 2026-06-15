@@ -1,7 +1,5 @@
 (function () {
   const THEOREM_PREFIX = "\\theorem";
-  const LABEL_PREFIX = "[label=";
-  const LATEX_LABEL_PREFIX = "\\label";
   let activeView = null;
 
   window.addEventListener("UNSTABLE_editor:extensions", (event) => {
@@ -91,15 +89,28 @@
       theorems: theorems.map((theorem) => ({
         label: theorem.label,
         text: theorem.text,
+        uses: theorem.uses,
+        context: theorem.context,
         from: theorem.from,
         to: theorem.to,
+        bodyFrom: theorem.bodyFrom,
+        bodyTo: theorem.bodyTo,
         coords: getTheoremCoords(view, theorem)
       }))
     }, "*");
   }
 
   function getTheoremCoords(view, theorem) {
-    const coords = view.coordsAtPos(theorem.to) || view.coordsAtPos(theorem.from);
+    const positions = [
+      theorem.bodyTo,
+      Math.max(theorem.from, theorem.to - 1),
+      theorem.from
+    ].filter((position) => typeof position === "number");
+    let coords = null;
+    for (const position of positions) {
+      coords = view.coordsAtPos(position);
+      if (coords) break;
+    }
     if (!coords) {
       return {
         left: 24,
@@ -144,15 +155,15 @@
     }
 
     let cursor = skipWhitespace(source, start + THEOREM_PREFIX.length);
-    let label = null;
 
-    if (source.startsWith(LABEL_PREFIX, cursor)) {
-      const labelStart = cursor + LABEL_PREFIX.length;
-      const labelEnd = source.indexOf("]", labelStart);
-      if (labelEnd === -1) return { ok: false };
-      label = source.slice(labelStart, labelEnd).trim();
-      cursor = skipWhitespace(source, labelEnd + 1);
+    if (source[cursor] !== "[") {
+      return { ok: false };
     }
+
+    const metadataResult = parseOptionalMetadata(source, cursor);
+    if (!metadataResult.ok) return { ok: false };
+    cursor = skipWhitespace(source, metadataResult.end);
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(metadataResult.metadata.label || "")) return { ok: false };
 
     if (source[cursor] !== "{") return { ok: false };
 
@@ -170,21 +181,18 @@
         depth -= 1;
         if (depth === 0) {
           const bodyEnd = cursor;
-          let theoremEnd = cursor + 1;
-          const labelResult = label
-            ? { ok: true, label, end: theoremEnd }
-            : parseTrailingLatexLabel(source, theoremEnd);
-          if (!labelResult.ok) return { ok: false };
-          theoremEnd = labelResult.end;
-          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(labelResult.label)) return { ok: false };
 
           return {
             ok: true,
             theorem: {
-              label: labelResult.label,
+              label: metadataResult.metadata.label,
               text: source.slice(bodyFrom, bodyEnd).trim(),
+              uses: metadataResult.metadata.uses,
+              context: metadataResult.metadata.context,
               from: start,
-              to: theoremEnd
+              to: cursor + 1,
+              bodyFrom,
+              bodyTo: bodyEnd
             }
           };
         }
@@ -196,22 +204,131 @@
     return { ok: false };
   }
 
-  function parseTrailingLatexLabel(source, cursor) {
-    cursor = skipWhitespace(source, cursor);
-    if (!source.startsWith(LATEX_LABEL_PREFIX, cursor)) return { ok: false };
+  function parseOptionalMetadata(source, cursor) {
+    const metadataStart = cursor + 1;
+    let depth = 0;
+    let bracketDepth = 0;
+    cursor = metadataStart;
 
-    cursor = skipWhitespace(source, cursor + LATEX_LABEL_PREFIX.length);
-    if (source[cursor] !== "{") return { ok: false };
+    while (cursor < source.length) {
+      const char = source[cursor];
+      const previous = source[cursor - 1];
 
-    const labelStart = cursor + 1;
-    const labelEnd = source.indexOf("}", labelStart);
-    if (labelEnd === -1) return { ok: false };
+      if (char === "{" && previous !== "\\") {
+        depth += 1;
+      } else if (char === "}" && previous !== "\\") {
+        depth = Math.max(0, depth - 1);
+      } else if (char === "[" && previous !== "\\" && depth === 0) {
+        bracketDepth += 1;
+      } else if (char === "]" && previous !== "\\" && depth === 0 && bracketDepth > 0) {
+        bracketDepth -= 1;
+      } else if (char === "]" && previous !== "\\" && depth === 0) {
+        return {
+          ok: true,
+          metadata: parseMetadata(source.slice(metadataStart, cursor)),
+          end: cursor + 1
+        };
+      }
 
-    return {
-      ok: true,
-      label: source.slice(labelStart, labelEnd).trim(),
-      end: labelEnd + 1
-    };
+      cursor += 1;
+    }
+
+    return { ok: false };
+  }
+
+  function parseMetadata(source) {
+    const metadata = { label: "", uses: [], context: "" };
+    for (const entry of splitMetadataEntries(source)) {
+      const separator = entry.indexOf("=");
+      if (separator === -1) continue;
+
+      const key = entry.slice(0, separator).trim();
+      const value = unbrace(entry.slice(separator + 1).trim());
+      if (key === "label") {
+        metadata.label = value.trim();
+      } else if (key === "uses") {
+        metadata.uses = splitTopLevel(value, ",")
+          .map((item) => unbrace(item.trim()).trim())
+          .filter(Boolean);
+      } else if (key === "context") {
+        metadata.context = value.trim();
+      }
+    }
+    return metadata;
+  }
+
+  function splitMetadataEntries(source) {
+    const parts = [];
+    let depth = 0;
+    let bracketDepth = 0;
+    let partStart = 0;
+
+    for (let index = 0; index < source.length; index += 1) {
+      const char = source[index];
+      const previous = source[index - 1];
+      if (char === "{" && previous !== "\\") {
+        depth += 1;
+      } else if (char === "}" && previous !== "\\") {
+        depth = Math.max(0, depth - 1);
+      } else if (char === "[" && previous !== "\\" && depth === 0) {
+        bracketDepth += 1;
+      } else if (char === "]" && previous !== "\\" && depth === 0 && bracketDepth > 0) {
+        bracketDepth -= 1;
+      } else if (isMetadataSeparator(source, index, depth, bracketDepth)) {
+        parts.push(source.slice(partStart, index));
+        partStart = index + 1;
+      }
+    }
+
+    parts.push(source.slice(partStart));
+    return parts;
+  }
+
+  function isMetadataSeparator(source, index, depth, bracketDepth) {
+    if (depth !== 0 || bracketDepth !== 0) {
+      return false;
+    }
+    if (source[index] === ",") {
+      return true;
+    }
+    if (source[index] !== "\n") {
+      return false;
+    }
+    return /^(?:\s*)(?:label|uses|context)\s*=/.test(source.slice(index + 1));
+  }
+
+  function splitTopLevel(source, separator) {
+    const parts = [];
+    let depth = 0;
+    let bracketDepth = 0;
+    let partStart = 0;
+
+    for (let index = 0; index < source.length; index += 1) {
+      const char = source[index];
+      const previous = source[index - 1];
+      if (char === "{" && previous !== "\\") {
+        depth += 1;
+      } else if (char === "}" && previous !== "\\") {
+        depth = Math.max(0, depth - 1);
+      } else if (char === "[" && previous !== "\\" && depth === 0) {
+        bracketDepth += 1;
+      } else if (char === "]" && previous !== "\\" && depth === 0 && bracketDepth > 0) {
+        bracketDepth -= 1;
+      } else if (char === separator && depth === 0 && bracketDepth === 0) {
+        parts.push(source.slice(partStart, index));
+        partStart = index + 1;
+      }
+    }
+
+    parts.push(source.slice(partStart));
+    return parts;
+  }
+
+  function unbrace(value) {
+    if (value.startsWith("{") && value.endsWith("}")) {
+      return value.slice(1, -1);
+    }
+    return value;
   }
 
   function skipWhitespace(source, cursor) {
