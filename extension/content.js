@@ -2,6 +2,7 @@
   const DEFAULT_COMPANION_URL = "http://127.0.0.1:31245";
   const DEFAULT_LEA_MODEL = "o4-mini";
   const DEFAULT_LEA_MAX_TURNS = 20;
+  const DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES = 3;
   const MODEL_FAMILY_LABELS = {
     openai: "OpenAI",
     gemini: "Gemini",
@@ -263,6 +264,10 @@
             <span>Max turns</span>
             <input type="number" min="1" max="200" data-role="max-turns">
           </label>
+          <label>
+            <span>Translation retries</span>
+            <input type="number" min="1" max="50" data-role="theorem-translation-max-retries">
+          </label>
           <button type="button" class="ol-lean-save-button" data-role="save-settings" disabled>Save changes</button>
         </section>
       </div>
@@ -273,11 +278,13 @@
     const status = popover.querySelector(".ol-lean-popover-status");
     const modelSelect = popover.querySelector("[data-role='model']");
     const maxTurnsInput = popover.querySelector("[data-role='max-turns']");
+    const theoremTranslationMaxRetriesInput = popover.querySelector("[data-role='theorem-translation-max-retries']");
     const saveButton = popover.querySelector("[data-role='save-settings']");
 
     closeButton.addEventListener("click", closePopover);
     modelSelect.addEventListener("change", markSettingsDirty);
     maxTurnsInput.addEventListener("input", markSettingsDirty);
+    theoremTranslationMaxRetriesInput.addEventListener("input", markSettingsDirty);
     for (const button of popover.querySelectorAll("[data-role='provider-key-toggle']")) {
       button.addEventListener("click", () => {
         const input = popover.querySelector(`[data-role='provider-key-input'][data-family='${button.dataset.family}']`);
@@ -299,6 +306,7 @@
         const settings = await savePopoverSettings(popover);
         popover.dataset.savedModel = settings.leaModel;
         popover.dataset.savedMaxTurns = String(settings.leaMaxTurns);
+        popover.dataset.savedTheoremTranslationMaxRetries = String(settings.leaTheoremTranslationMaxRetries);
         renderProviderKeys(popover, settings.leaProviderKeys || {});
         clearProviderKeyInputs(popover);
         refreshModelAvailability(popover);
@@ -329,6 +337,7 @@
       const selectedFamilyConfigured = Boolean(getEffectiveProviderKeyStatus(popover)[family]?.configured);
       const dirty = modelSelect.value !== popover.dataset.savedModel ||
         String(Number.parseInt(maxTurnsInput.value, 10) || DEFAULT_LEA_MAX_TURNS) !== popover.dataset.savedMaxTurns ||
+        String(Number.parseInt(theoremTranslationMaxRetriesInput.value, 10) || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES) !== popover.dataset.savedTheoremTranslationMaxRetries ||
         hasProviderKeyInput(popover);
       saveButton.disabled = !dirty || !selectedFamilyConfigured;
     }
@@ -688,7 +697,8 @@
       leaRepoPath: "",
       leaApiBaseUrl: "http://127.0.0.1:8000",
       leaModel: DEFAULT_LEA_MODEL,
-      leaMaxTurns: DEFAULT_LEA_MAX_TURNS
+      leaMaxTurns: DEFAULT_LEA_MAX_TURNS,
+      leaTheoremTranslationMaxRetries: DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES
     });
   }
 
@@ -707,6 +717,7 @@
         leaApiBaseUrl: payload.leaApiBaseUrl || stored.leaApiBaseUrl || "http://127.0.0.1:8000",
         leaModel: payload.leaModel || stored.leaModel || DEFAULT_LEA_MODEL,
         leaMaxTurns: payload.leaMaxTurns || stored.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
+        leaTheoremTranslationMaxRetries: payload.leaTheoremTranslationMaxRetries || stored.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES,
         leaModelOptions: payload.leaModelOptions || DEFAULT_MODEL_OPTIONS,
         leaProviderKeys: payload.leaProviderKeys || {}
       };
@@ -715,7 +726,8 @@
         leaRepoPath: settings.leaRepoPath,
         leaApiBaseUrl: settings.leaApiBaseUrl,
         leaModel: settings.leaModel,
-        leaMaxTurns: settings.leaMaxTurns
+        leaMaxTurns: settings.leaMaxTurns,
+        leaTheoremTranslationMaxRetries: settings.leaTheoremTranslationMaxRetries
       });
       return settings;
     } catch {
@@ -732,6 +744,7 @@
     const settings = await loadCompanionSettings();
     const modelSelect = popover.querySelector("[data-role='model']");
     const maxTurnsInput = popover.querySelector("[data-role='max-turns']");
+    const theoremTranslationMaxRetriesInput = popover.querySelector("[data-role='theorem-translation-max-retries']");
     popover.dataset.modelOptions = JSON.stringify(settings.leaModelOptions || DEFAULT_MODEL_OPTIONS);
     renderProviderKeys(popover, settings.leaProviderKeys || {});
     renderModelOptions(
@@ -741,8 +754,10 @@
       getEffectiveProviderKeyStatus(popover)
     );
     maxTurnsInput.value = String(settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS);
+    theoremTranslationMaxRetriesInput.value = String(settings.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES);
     popover.dataset.savedModel = modelSelect.value;
     popover.dataset.savedMaxTurns = String(Number.parseInt(maxTurnsInput.value, 10) || DEFAULT_LEA_MAX_TURNS);
+    popover.dataset.savedTheoremTranslationMaxRetries = String(Number.parseInt(theoremTranslationMaxRetriesInput.value, 10) || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES);
     popover.querySelector("[data-role='save-settings']").disabled = true;
   }
 
@@ -854,6 +869,7 @@
     const baseUrl = String(current.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
     const leaModel = popover.querySelector("[data-role='model']").value || DEFAULT_LEA_MODEL;
     const leaMaxTurns = Number.parseInt(popover.querySelector("[data-role='max-turns']").value, 10) || DEFAULT_LEA_MAX_TURNS;
+    const leaTheoremTranslationMaxRetries = Number.parseInt(popover.querySelector("[data-role='theorem-translation-max-retries']").value, 10) || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES;
     const response = await fetch(`${baseUrl}/settings/lea`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -862,6 +878,7 @@
         leaApiBaseUrl: current.leaApiBaseUrl,
         leaModel,
         leaMaxTurns,
+        leaTheoremTranslationMaxRetries,
         leaProviderApiKeys: collectProviderApiKeyPatch(popover)
       })
     });
@@ -874,7 +891,8 @@
       leaRepoPath: payload.leaRepoPath,
       leaApiBaseUrl: payload.leaApiBaseUrl,
       leaModel: payload.leaModel,
-      leaMaxTurns: payload.leaMaxTurns
+      leaMaxTurns: payload.leaMaxTurns,
+      leaTheoremTranslationMaxRetries: payload.leaTheoremTranslationMaxRetries
     });
     return payload;
   }

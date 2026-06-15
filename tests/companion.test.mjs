@@ -82,6 +82,7 @@ test("settings response includes model families and key status", async () => {
   assert.equal(response.leaProviderKeys.openai.configured, true);
   assert.equal(response.leaProviderKeys.gemini.configured, false);
   assert.equal(response.leaProviderKeys.anthropic.configured, true);
+  assert.equal(response.leaTheoremTranslationMaxRetries, 3);
 });
 
 test("settings reject unsupported models and missing family keys", async () => {
@@ -115,7 +116,8 @@ test("settings save supported models when their family key is configured", async
     leaRepoPath: leaRepo,
     leaApiBaseUrl: "http://127.0.0.1:8000",
     leaModel: "gpt-5.4-mini",
-    leaMaxTurns: 34
+    leaMaxTurns: 34,
+    leaTheoremTranslationMaxRetries: 8
   }, state);
   const geminiResult = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
@@ -134,12 +136,16 @@ test("settings save supported models when their family key is configured", async
   assert.equal(openAiResult.body.leaProvider, "openai");
   assert.equal(openAiResult.body.leaModel, "gpt-5.4-mini");
   assert.equal(openAiResult.body.leaMaxTurns, 34);
+  assert.equal(openAiResult.body.leaTheoremTranslationMaxRetries, 8);
   assert.equal(geminiResult.statusCode, 200);
   assert.equal(geminiResult.body.leaProvider, "gemini");
   assert.equal(geminiResult.body.leaModel, "gemini/gemini-2.5-flash");
   assert.equal(anthropicResult.statusCode, 200);
   assert.equal(anthropicResult.body.leaProvider, "anthropic");
   assert.equal(anthropicResult.body.leaModel, "anthropic/claude-sonnet-4-6");
+
+  const saved = JSON.parse(await fs.readFile(state.settingsPath, "utf8"));
+  assert.equal(saved.leaTheoremTranslationMaxRetries, 8);
 });
 
 test("settings normalize legacy Anthropic model ids", async () => {
@@ -513,6 +519,7 @@ test("stub starts Lea in theorem translation approval mode and records a sorry s
   const calls = [];
   const state = await makeState({
     leaRepoPath: leaRepo,
+    leaTheoremTranslationMaxRetries: 9,
     env: { OPENAI_API_KEY: "test-key" },
     fetchImpl: makeLeaApiFetch(calls, {
       approval: {
@@ -533,6 +540,7 @@ test("stub starts Lea in theorem translation approval mode and records a sorry s
   assert.equal(result.body.declarationName, "generated_stub_test");
   assert.equal(calls[0].url, "http://127.0.0.1:8000/v1/runs");
   assert.equal(calls[0].body.config.agent.permission_tier, "theorem_translation");
+  assert.equal(calls[0].body.config.agent.theorem_translation_max_retries, 9);
   assert.equal(calls[0].body.config.model.model_kwargs.api_key, "test-key");
   const job = state.jobs[result.body.jobId];
   assert.equal(job.status, "sorry_stub");
@@ -2043,6 +2051,7 @@ async function makeState(overrides = {}) {
         leaProviderApiKeys: overrides.leaProviderApiKeys || {},
         ...(overrides.leaApiKey ? { leaApiKey: overrides.leaApiKey } : {}),
         leaMaxTurns: 20,
+        leaTheoremTranslationMaxRetries: overrides.leaTheoremTranslationMaxRetries || 3,
         ...(overrides.leaJobTimeoutSeconds ? {
           leaJobTimeoutSeconds: overrides.leaJobTimeoutSeconds
         } : {})

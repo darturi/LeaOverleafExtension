@@ -31,6 +31,7 @@ const JOB_LOG_DIR = path.join(APP_DIR, "jobs");
 const DEFAULT_LEA_MODEL = "o4-mini";
 const DEFAULT_LEA_API_BASE_URL = "http://127.0.0.1:8000";
 const DEFAULT_LEA_MAX_TURNS = 20;
+const DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES = 3;
 const DEFAULT_LEA_JOB_TIMEOUT_SECONDS = 900;
 const DEFAULT_LEA_MODEL_MAX_TOKENS = 16384;
 const PROVIDER_KEY_VALIDATION_TIMEOUT_MS = 5000;
@@ -309,6 +310,11 @@ export async function handleUpdateLeaSettings(payload, state) {
     leaProvider: modelInfo.family,
     leaModel: model,
     leaMaxTurns: normalizeLeaMaxTurns(payload.leaMaxTurns || DEFAULT_LEA_MAX_TURNS),
+    leaTheoremTranslationMaxRetries: normalizeLeaTheoremTranslationMaxRetries(
+      payload.leaTheoremTranslationMaxRetries ||
+      state.settings.leaTheoremTranslationMaxRetries ||
+      DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES
+    ),
     leaJobTimeoutSeconds: Number.parseInt(
     String(payload.leaJobTimeoutSeconds || state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS),
     10
@@ -483,6 +489,7 @@ export function buildSettingsResponse(state) {
     leaModel: modelInfo.id,
     leaModelOptions: LEA_MODEL_OPTIONS,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
+    leaTheoremTranslationMaxRetries: state.settings.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES,
     leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
   };
 }
@@ -858,6 +865,7 @@ async function createLeaJob({ state, target, theoremText, theoremContext = "", r
     leaProviderFamily: modelInfo.family,
     leaModel: modelInfo.id,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
+    leaTheoremTranslationMaxRetries: state.settings.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES,
     leaCurrentTurn: null,
     leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
   };
@@ -958,6 +966,7 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
     apiKey: state.env?.LEA_API_KEY,
     model: job.leaModel,
     maxTurns: job.leaMaxTurns,
+    theoremTranslationMaxRetries: job.leaTheoremTranslationMaxRetries,
     providerApiKey: getProviderApiKey(state, job.leaProviderFamily),
     prompt,
     project: {
@@ -1138,6 +1147,7 @@ async function createStubJob({ state, job, target, theoremText, theoremContext =
     apiKey: state.env?.LEA_API_KEY,
     model: job.leaModel,
     maxTurns: job.leaMaxTurns,
+    theoremTranslationMaxRetries: job.leaTheoremTranslationMaxRetries,
     providerApiKey: getProviderApiKey(state, job.leaProviderFamily),
     prompt,
     project: {
@@ -1350,6 +1360,7 @@ async function runLeaApiProofJob({
   apiKey,
   model,
   maxTurns,
+  theoremTranslationMaxRetries,
   providerApiKey,
   prompt,
   project,
@@ -1364,6 +1375,7 @@ async function runLeaApiProofJob({
     apiKey,
     model,
     maxTurns,
+    theoremTranslationMaxRetries,
     providerApiKey,
     prompt,
     project,
@@ -1398,6 +1410,7 @@ async function runLeaApiApprovalStubJob({
   apiKey,
   model,
   maxTurns,
+  theoremTranslationMaxRetries,
   providerApiKey,
   prompt,
   project,
@@ -1412,6 +1425,7 @@ async function runLeaApiApprovalStubJob({
     apiKey,
     model,
     maxTurns,
+    theoremTranslationMaxRetries,
     providerApiKey,
     prompt,
     project,
@@ -1446,6 +1460,7 @@ async function startLeaApiRun({
   apiKey,
   model,
   maxTurns,
+  theoremTranslationMaxRetries,
   providerApiKey,
   prompt,
   project,
@@ -1469,7 +1484,7 @@ async function startLeaApiRun({
         max_turns: maxTurns,
         narrate_tool_steps: false,
         permission_tier: permissionTier,
-        theorem_translation_max_retries: 3
+        theorem_translation_max_retries: normalizeLeaTheoremTranslationMaxRetries(theoremTranslationMaxRetries)
       }
     },
     project
@@ -1941,6 +1956,11 @@ function toPositiveInteger(value) {
 function normalizeLeaMaxTurns(value) {
   const parsed = Number.parseInt(String(value || DEFAULT_LEA_MAX_TURNS), 10);
   return Number.isFinite(parsed) && parsed >= 1 ? parsed : DEFAULT_LEA_MAX_TURNS;
+}
+
+function normalizeLeaTheoremTranslationMaxRetries(value) {
+  const parsed = Number.parseInt(String(value || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES), 10);
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES;
 }
 
 async function fetchJson(fetchImpl, url, options) {
