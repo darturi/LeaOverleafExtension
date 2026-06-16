@@ -24,7 +24,11 @@ The MVP requires theorem blocks with extension metadata in the optional argument
 
 The `label=...` value is used as the Overleaf theorem identifier and fallback generated Lean declaration name. It must be a valid Lean identifier: letters, digits, and underscores, with no leading digit.
 
-To point Lea at especially helpful prior results, add `uses={...}` with one or more previously formalized Overleaf labels:
+The optional argument also accepts two optional metadata fields: `uses={...}` and `context={...}`.
+
+### `uses={...}`
+
+Use `uses={...}` when a theorem should depend on one or more earlier theorems from the same Overleaf project. The values are Overleaf labels, not Lean theorem names. Each referenced theorem must already be formalized, or at least have a saved sorry stub, before Lea starts the new run.
 
 ```tex
 \theorem[label=my_next_theorem, uses={my_prior_theorem, another_prior_theorem}]{
@@ -32,9 +36,21 @@ To point Lea at especially helpful prior results, add `uses={...}` with one or m
 }
 ```
 
-Each `uses={...}` entry must be a valid label in the same Overleaf project and must already be formalized. The companion resolves those labels to Lea's recorded theorem names and proof files before starting the new run.
+The companion resolves each label to Lea's recorded theorem name, module name, and proof file before sending the prompt. Lea is then instructed to make use of those results during formalization.
 
-To give Lea natural-language formalization tips, add `context={...}`:
+Each `uses={...}` entry must be a valid Lean identifier:
+
+```tex
+\theorem[label=final_result, uses={base_case, induction_step}]{
+  The final result follows from the base case and induction step.
+}
+```
+
+If a referenced label cannot be resolved, the extension blocks the run and reports which theorem needs to be formalized first.
+
+### `context={...}`
+
+Use `context={...}` to pass natural-language guidance to Lea for this specific theorem. This is useful for proof strategy, notation hints, suggested lemmas, or warnings about how to interpret the statement.
 
 ```tex
 \theorem[label=my_guided_theorem, context={Use induction on n, then simplify.}]{
@@ -42,7 +58,30 @@ To give Lea natural-language formalization tips, add `context={...}`:
 }
 ```
 
-When provided, the context is added to the Lea prompt as formalization guidance. Use braces around context text that contains commas or spans multiple lines, just as with `uses={...}`.
+When provided, the context text is added to the Lea prompt as formalization guidance. It does not affect LaTeX rendering.
+
+Use braces around context text that contains commas, square-bracket tactics, or spans multiple lines:
+
+```tex
+\theorem[
+  label=even_square,
+  context={Use the assumption that n is even, rewrite n as 2 * k, then use ring_nf.}
+]{
+  If n is even, then n^2 is even.
+}
+```
+
+You can combine `label`, `uses`, and `context` in the same theorem:
+
+```tex
+\theorem[
+  label=main_bound,
+  uses={auxiliary_bound, monotonicity_lemma},
+  context={Start from auxiliary_bound, then apply monotonicity_lemma to compare the two sides.}
+]{
+  The desired main bound holds.
+}
+```
 
 For a minimal test document, define the display macro in the preamble. The optional argument is consumed by the extension and ignored by LaTeX rendering:
 
