@@ -44,7 +44,8 @@ test("applies environment defaults without replacing explicit settings", () => {
       LEA_REPO_PATH: "/tmp/lea",
       LEA_MODEL: "env-model",
       LEA_MAX_TURNS: "7",
-      LEA_THEOREM_TRANSLATION_MAX_RETRIES: "5"
+      LEA_THEOREM_TRANSLATION_MAX_RETRIES: "5",
+      LEA_MAX_SPEND_USD: "12.5"
     }
   );
 
@@ -52,12 +53,30 @@ test("applies environment defaults without replacing explicit settings", () => {
   assert.equal(settings.leaModel, "explicit-model");
   assert.equal(settings.leaMaxTurns, 7);
   assert.equal(settings.leaTheoremTranslationMaxRetries, 5);
+  assert.equal(settings.leaMaxSpendUsd, 12.5);
   assert.equal(settings.leaApiKey, "legacy-openai-key");
   assert.equal(settings.leaProviderApiKeys, undefined);
+});
+
+test("explicit max spend overrides environment default", () => {
+  const settings = applyEnvDefaults(
+    { leaMaxSpendUsd: 3.25 },
+    { LEA_MAX_SPEND_USD: "12.5" }
+  );
+
+  assert.equal(settings.leaMaxSpendUsd, 3.25);
+});
+
+test("negative max spend is rejected", () => {
+  assert.throws(
+    () => applyEnvDefaults({}, { LEA_MAX_SPEND_USD: "-1" }),
+    /leaMaxSpendUsd/
+  );
 });
 
 test("derives local path defaults when env values are absent", () => {
   const settings = applyEnvDefaults({}, {});
 
   assert.equal(settings.leaRepoPath, path.join(PROJECT_ROOT, "vendor", "lea-prover"));
+  assert.equal(settings.leaMaxSpendUsd, null);
 });

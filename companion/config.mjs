@@ -34,6 +34,12 @@ export function loadDotEnv(projectRoot) {
 }
 
 export function applyEnvDefaults(settings, env = process.env) {
+  const leaMaxSpendUsd = normalizeOptionalNonNegativeNumber(
+    Object.prototype.hasOwnProperty.call(settings, "leaMaxSpendUsd")
+      ? settings.leaMaxSpendUsd
+      : env.LEA_MAX_SPEND_USD,
+    "leaMaxSpendUsd"
+  );
   return {
     ...settings,
     leaRepoPath: settings.leaRepoPath || env.LEA_REPO_PATH || DEFAULT_LEA_REPO_PATH,
@@ -42,6 +48,16 @@ export function applyEnvDefaults(settings, env = process.env) {
     leaModel: settings.leaModel || env.LEA_MODEL || "o4-mini",
     leaMaxTurns: settings.leaMaxTurns || parseInt(env.LEA_MAX_TURNS || "20", 10),
     leaTheoremTranslationMaxRetries: settings.leaTheoremTranslationMaxRetries || parseInt(env.LEA_THEOREM_TRANSLATION_MAX_RETRIES || "3", 10),
-    leaJobTimeoutSeconds: settings.leaJobTimeoutSeconds || parseInt(env.LEA_JOB_TIMEOUT_SECONDS || "900", 10)
+    leaJobTimeoutSeconds: settings.leaJobTimeoutSeconds || parseInt(env.LEA_JOB_TIMEOUT_SECONDS || "900", 10),
+    leaMaxSpendUsd
   };
+}
+
+function normalizeOptionalNonNegativeNumber(value, fieldName) {
+  if (value === undefined || value === null || value === "") return null;
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) {
+    throw new Error(`${fieldName} must be greater than or equal to 0`);
+  }
+  return number;
 }

@@ -35,6 +35,8 @@ const DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES = 3;
 const DEFAULT_LEA_JOB_TIMEOUT_SECONDS = 900;
 const DEFAULT_LEA_MODEL_MAX_TOKENS = 16384;
 const PROVIDER_KEY_VALIDATION_TIMEOUT_MS = 5000;
+const MAX_SPEND_MESSAGE = "Max spend limit reached. Lea run was cancelled.";
+const MAX_SPEND_BLOCK_MESSAGE = "Max spend limit has been reached.";
 const LEA_MODEL_FAMILIES = [
   { id: "openai", label: "OpenAI", envVars: ["OPENAI_API_KEY"] },
   { id: "gemini", label: "Gemini", envVars: ["GEMINI_API_KEY", "GOOGLE_API_KEY"] },
@@ -152,6 +154,9 @@ export async function handleFormalize(payload, state) {
   if (!leaValidation.ok) {
     return errorResponse(400, leaValidation.error, leaValidation.message);
   }
+  if (spendLimitReached(state)) {
+    return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
+  }
 
   const target = buildLeaTarget({
     leaRepoPath: state.settings.leaRepoPath,
@@ -228,6 +233,9 @@ export async function handleStub(payload, state) {
   if (!leaValidation.ok) {
     return errorResponse(400, leaValidation.error, leaValidation.message);
   }
+  if (spendLimitReached(state)) {
+    return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
+  }
 
   const target = buildLeaTarget({
     leaRepoPath: state.settings.leaRepoPath,
@@ -264,7 +272,19 @@ export async function handleStub(payload, state) {
 
   try {
     await createStubJob({ state, job, target, theoremText, theoremContext });
+    if (job.finalStatus === "max_spend") {
+      return {
+        statusCode: 200,
+        body: buildJobResponse({ job, status: "failed", target })
+      };
+    }
   } catch (error) {
+    if (job.finalStatus === "max_spend") {
+      return {
+        statusCode: 200,
+        body: buildJobResponse({ job, status: "failed", target })
+      };
+    }
     job.status = "failed";
     job.error = error instanceof Error ? error.message : String(error);
     job.finishedAt = new Date().toISOString();
@@ -302,6 +322,16 @@ export async function handleUpdateLeaSettings(payload, state) {
   }
 
   const providerEnvPatch = buildProviderEnvPatch(payload.leaProviderApiKeys);
+  let leaMaxSpendUsd;
+  try {
+    leaMaxSpendUsd = normalizeLeaMaxSpendUsd(
+      Object.prototype.hasOwnProperty.call(payload, "leaMaxSpendUsd")
+        ? payload.leaMaxSpendUsd
+        : state.settings.leaMaxSpendUsd
+    );
+  } catch {
+    return errorResponse(400, "invalid_max_spend", "Lea max spend must be greater than or equal to 0.");
+  }
   const nextSettings = {
     ...state.settings,
     leaRepoPath: path.resolve(leaRepoPath),
@@ -310,6 +340,7 @@ export async function handleUpdateLeaSettings(payload, state) {
     leaProvider: modelInfo.family,
     leaModel: model,
     leaMaxTurns: normalizeLeaMaxTurns(payload.leaMaxTurns || DEFAULT_LEA_MAX_TURNS),
+    leaMaxSpendUsd,
     leaTheoremTranslationMaxRetries: normalizeLeaTheoremTranslationMaxRetries(
       payload.leaTheoremTranslationMaxRetries ||
       state.settings.leaTheoremTranslationMaxRetries ||
@@ -349,11 +380,16 @@ export async function handleUpdateLeaSettings(payload, state) {
 
 export function handleGetUsage(payload, state) {
   const overleafProjectId = String(payload.overleafProjectId || "unknown");
+  const allTime = aggregateUsage(state.jobs || {}, {});
+  const leaMaxSpendUsd = normalizeLeaMaxSpendUsd(state.settings?.leaMaxSpendUsd);
   return {
     statusCode: 200,
     body: {
       project: aggregateUsage(state.jobs || {}, { overleafProjectId }),
-      allTime: aggregateUsage(state.jobs || {}, {})
+      allTime,
+      leaMaxSpendUsd,
+      leaCurrentSpendUsd: allTime.costUsd,
+      leaSpendLimitReached: spendLimitReached(state)
     }
   };
 }
@@ -489,6 +525,8 @@ export function buildSettingsResponse(state) {
     leaModel: modelInfo.id,
     leaModelOptions: LEA_MODEL_OPTIONS,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
+    leaMaxSpendUsd: normalizeLeaMaxSpendUsd(state.settings.leaMaxSpendUsd),
+    leaCurrentSpendUsd: aggregateUsage(state.jobs || {}, {}).costUsd,
     leaTheoremTranslationMaxRetries: state.settings.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES,
     leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
   };
@@ -682,7 +720,8 @@ function sanitizeRuntimeSettings(settings) {
   } = settings || {};
   return {
     ...rest,
-    leaModel: normalizeLeaModelId(rest.leaModel || DEFAULT_LEA_MODEL)
+    leaModel: normalizeLeaModelId(rest.leaModel || DEFAULT_LEA_MODEL),
+    leaMaxSpendUsd: normalizeLeaMaxSpendUsd(rest.leaMaxSpendUsd)
   };
 }
 
@@ -976,19 +1015,19 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
     },
     logPath: job.logPath,
     timeoutMs: job.leaJobTimeoutSeconds * 1000,
-    onUsageUpdated: async (usage) => {
-      if (usage.delta) {
-        recordJobUsageDelta(job, usage);
-      } else {
-        recordJobUsageSnapshot(job, usage);
-      }
+    onRunStarted: async (apiRunId) => {
+      job.apiRunId = apiRunId;
       await writeJson(state.jobsPath, state.jobs);
+    },
+    onUsageUpdated: async (usage) => {
+      return recordUsageAndEnforceSpendLimit({ state, job, usage, mode: "formalization" });
     },
     onProgressUpdated: async (progress) => {
       if (!recordJobTurnProgress(job, progress)) return;
       await writeJson(state.jobsPath, state.jobs);
     }
   });
+  if (job.finalStatus === "max_spend") return;
 
   const artifact = exit.ok
     ? await identifyLeaArtifact({
@@ -1157,13 +1196,12 @@ async function createStubJob({ state, job, target, theoremText, theoremContext =
     },
     logPath: job.logPath,
     timeoutMs: job.leaJobTimeoutSeconds * 1000,
-    onUsageUpdated: async (usage) => {
-      if (usage.delta) {
-        recordJobUsageDelta(job, usage);
-      } else {
-        recordJobUsageSnapshot(job, usage);
-      }
+    onRunStarted: async (apiRunId) => {
+      job.apiRunId = apiRunId;
       await writeJson(state.jobsPath, state.jobs);
+    },
+    onUsageUpdated: async (usage) => {
+      return recordUsageAndEnforceSpendLimit({ state, job, usage, mode: "stub" });
     },
     onProgressUpdated: async (progress) => {
       if (!recordJobTurnProgress(job, progress)) return;
@@ -1172,6 +1210,7 @@ async function createStubJob({ state, job, target, theoremText, theoremContext =
   });
 
   if (!pause.ok) {
+    if (job.finalStatus === "max_spend") return;
     throw new Error(pause.error || "Lea did not produce a theorem-translation approval.");
   }
 
@@ -1222,18 +1261,14 @@ async function runLeaJobFromApproval({ state, job, target }) {
     logPath: job.logPath,
     timeoutMs: job.leaJobTimeoutSeconds * 1000,
     onUsageUpdated: async (usage) => {
-      if (usage.delta) {
-        recordJobUsageDelta(job, usage);
-      } else {
-        recordJobUsageSnapshot(job, usage);
-      }
-      await writeJson(state.jobsPath, state.jobs);
+      return recordUsageAndEnforceSpendLimit({ state, job, usage, mode: "approval resume" });
     },
     onProgressUpdated: async (progress) => {
       if (!recordJobTurnProgress(job, progress)) return;
       await writeJson(state.jobsPath, state.jobs);
     }
   });
+  if (job.finalStatus === "max_spend") return;
 
   await finishLeaProofJob({ state, job, target, beforeMarkers, exit });
 }
@@ -1366,6 +1401,7 @@ async function runLeaApiProofJob({
   project,
   logPath,
   timeoutMs,
+  onRunStarted = null,
   onUsageUpdated = null,
   onProgressUpdated = null
 }) {
@@ -1390,6 +1426,7 @@ async function runLeaApiProofJob({
     return { ok: false, timedOut: false, error: "Lea API did not return a run_id." };
   }
   await appendLog(logPath, `[backend] Lea API run started: ${apiRunId}\n`);
+  if (onRunStarted) await onRunStarted(apiRunId);
 
   return waitForLeaApiProofJob({
     fetchImpl,
@@ -1416,6 +1453,7 @@ async function runLeaApiApprovalStubJob({
   project,
   logPath,
   timeoutMs,
+  onRunStarted = null,
   onUsageUpdated = null,
   onProgressUpdated = null
 }) {
@@ -1440,6 +1478,7 @@ async function runLeaApiApprovalStubJob({
     return { ok: false, timedOut: false, error: "Lea API did not return a run_id." };
   }
   await appendLog(logPath, `[backend] Lea API theorem-translation run started: ${apiRunId}\n`);
+  if (onRunStarted) await onRunStarted(apiRunId);
 
   return waitForLeaApiApprovalPause({
     fetchImpl,
@@ -1511,6 +1550,7 @@ async function waitForLeaApiProofJob({
 }) {
   const started = Date.now();
   const usageAbort = new AbortController();
+  const stopState = { requested: false, error: null };
   const eventsPromise = tailLeaRunUsageEvents({
     fetchImpl,
     baseUrl,
@@ -1520,11 +1560,17 @@ async function waitForLeaApiProofJob({
     maxTurns,
     onUsageUpdated,
     onProgressUpdated,
+    stopState,
     signal: usageAbort.signal
   });
 
   while (Date.now() - started < timeoutMs) {
     await delay(Math.min(1000, Math.max(1, timeoutMs - (Date.now() - started))), { ref: refTimers });
+    if (stopState.requested) {
+      usageAbort.abort();
+      await settleUsageEvents(eventsPromise);
+      return { ok: false, timedOut: false, apiRunId, error: stopState.error || "Lea API run stopped." };
+    }
     const statusResponse = await fetchJson(fetchImpl, `${baseUrl}/v1/runs/${encodeURIComponent(apiRunId)}`, {
       method: "GET",
       headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
@@ -1589,6 +1635,7 @@ async function waitForLeaApiApprovalPause({
 }) {
   const started = Date.now();
   const usageAbort = new AbortController();
+  const stopState = { requested: false, error: null };
   const eventsPromise = tailLeaRunUsageEvents({
     fetchImpl,
     baseUrl,
@@ -1598,11 +1645,17 @@ async function waitForLeaApiApprovalPause({
     maxTurns,
     onUsageUpdated,
     onProgressUpdated,
+    stopState,
     signal: usageAbort.signal
   });
 
   while (Date.now() - started < timeoutMs) {
     await delay(Math.min(1000, Math.max(1, timeoutMs - (Date.now() - started))), { ref: refTimers });
+    if (stopState.requested) {
+      usageAbort.abort();
+      await settleUsageEvents(eventsPromise);
+      return { ok: false, timedOut: false, apiRunId, error: stopState.error || "Lea API run stopped." };
+    }
     const statusResponse = await getLeaApiRun({ fetchImpl, baseUrl, apiKey, apiRunId });
     if (!statusResponse.ok) {
       usageAbort.abort();
@@ -1673,6 +1726,28 @@ function acceptLeaApproval({ fetchImpl, baseUrl, apiKey, apiRunId, approvalId })
   });
 }
 
+async function cancelLeaApiRun({ fetchImpl, baseUrl, apiKey, apiRunId }) {
+  const headers = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
+  const candidates = [
+    {
+      url: `${baseUrl}/v1/runs/${encodeURIComponent(apiRunId)}/cancel`,
+      options: { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: "{}" }
+    },
+    {
+      url: `${baseUrl}/v1/runs/${encodeURIComponent(apiRunId)}`,
+      options: { method: "DELETE", headers }
+    }
+  ];
+  let lastError = "";
+  for (const candidate of candidates) {
+    const result = await fetchJson(fetchImpl, candidate.url, candidate.options);
+    if (result.ok) return result;
+    lastError = result.error;
+    if (!/HTTP 404|HTTP 405/.test(result.error || "")) break;
+  }
+  return { ok: false, error: lastError || "Lea API cancellation endpoint is unavailable." };
+}
+
 async function tailLeaRunUsageEvents({
   fetchImpl,
   baseUrl,
@@ -1682,6 +1757,7 @@ async function tailLeaRunUsageEvents({
   maxTurns,
   onUsageUpdated,
   onProgressUpdated,
+  stopState,
   signal
 }) {
   if (!onUsageUpdated && !onProgressUpdated) return;
@@ -1702,12 +1778,12 @@ async function tailLeaRunUsageEvents({
       const frames = buffer.split(/\r?\n\r?\n/);
       buffer = frames.pop() || "";
       for (const frame of frames) {
-        const shouldContinue = await handleLeaEventFrame(frame, { maxTurns, onUsageUpdated, onProgressUpdated });
+        const shouldContinue = await handleLeaEventFrame(frame, { maxTurns, onUsageUpdated, onProgressUpdated, stopState });
         if (!shouldContinue) return;
       }
     }
     if (buffer.trim()) {
-      await handleLeaEventFrame(buffer, { maxTurns, onUsageUpdated, onProgressUpdated });
+      await handleLeaEventFrame(buffer, { maxTurns, onUsageUpdated, onProgressUpdated, stopState });
     }
   } catch (error) {
     if (error?.name === "AbortError") return;
@@ -1715,7 +1791,7 @@ async function tailLeaRunUsageEvents({
   }
 }
 
-async function handleLeaEventFrame(frame, { maxTurns, onUsageUpdated, onProgressUpdated }) {
+async function handleLeaEventFrame(frame, { maxTurns, onUsageUpdated, onProgressUpdated, stopState }) {
   const data = frame
     .split(/\r?\n/)
     .filter((line) => line.startsWith("data:"))
@@ -1735,19 +1811,33 @@ async function handleLeaEventFrame(frame, { maxTurns, onUsageUpdated, onProgress
 
   if (event.type === "usage_updated") {
     if (onUsageUpdated) {
-      await onUsageUpdated({
+      const result = await onUsageUpdated({
         inputTokens: event.input_tokens,
         outputTokens: event.output_tokens,
         totalTokens: toNonNegativeNumber(event.input_tokens) + toNonNegativeNumber(event.output_tokens),
         costUsd: event.cost,
         delta: true
       });
+      if (result?.stop) {
+        if (stopState) {
+          stopState.requested = true;
+          stopState.error = result.error || "";
+        }
+        return false;
+      }
     }
     return true;
   }
   if (event.type === "finished") {
     if (onUsageUpdated && (event.usage || event.cost !== undefined)) {
-      await onUsageUpdated(extractEventUsage(event));
+      const result = await onUsageUpdated(extractEventUsage(event));
+      if (result?.stop) {
+        if (stopState) {
+          stopState.requested = true;
+          stopState.error = result.error || "";
+        }
+        return false;
+      }
     }
     return false;
   }
@@ -1963,6 +2053,58 @@ function normalizeLeaTheoremTranslationMaxRetries(value) {
   return Number.isFinite(parsed) && parsed >= 1 ? parsed : DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES;
 }
 
+function normalizeLeaMaxSpendUsd(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) {
+    throw new Error("leaMaxSpendUsd must be greater than or equal to 0");
+  }
+  return number;
+}
+
+function spendLimitReached(state) {
+  const maxSpendUsd = normalizeLeaMaxSpendUsd(state.settings?.leaMaxSpendUsd);
+  if (maxSpendUsd === null) return false;
+  return aggregateUsage(state.jobs || {}, {}).costUsd >= maxSpendUsd;
+}
+
+async function recordUsageAndEnforceSpendLimit({ state, job, usage, mode }) {
+  if (usage.delta) {
+    recordJobUsageDelta(job, usage);
+  } else {
+    recordJobUsageSnapshot(job, usage);
+  }
+  if (spendLimitReached(state)) {
+    await markJobMaxSpend({ state, job, mode });
+    return { stop: true, error: MAX_SPEND_MESSAGE };
+  }
+  await writeJson(state.jobsPath, state.jobs);
+  return { stop: false };
+}
+
+async function markJobMaxSpend({ state, job, mode }) {
+  job.status = "failed";
+  job.finalStatus = "max_spend";
+  job.error = MAX_SPEND_MESSAGE;
+  job.exitCode = 1;
+  job.finishedAt = new Date().toISOString();
+  await appendLog(job.logPath, `\n[backend] ${MAX_SPEND_MESSAGE}\n`);
+  if (job.apiRunId) {
+    const cancel = await cancelLeaApiRun({
+      fetchImpl: state.fetchImpl || fetch,
+      baseUrl: job.leaApiBaseUrl,
+      apiKey: state.env?.LEA_API_KEY,
+      apiRunId: job.apiRunId
+    });
+    if (!cancel.ok) {
+      await appendLog(job.logPath, `[backend] Failed to cancel Lea API run ${job.apiRunId}: ${cancel.error}\n`);
+    }
+  } else if (mode) {
+    await appendLog(job.logPath, `[backend] Cost cap reached before Lea API run id was available for ${mode}.\n`);
+  }
+  await writeJson(state.jobsPath, state.jobs);
+}
+
 async function fetchJson(fetchImpl, url, options) {
   try {
     const response = await fetchImpl(url, options);
@@ -2076,6 +2218,7 @@ function buildJobResponse({ job, status, target }) {
     recordedProofPath: job.recordedProofPath || null,
     moduleName: job.moduleName || null,
     logTail: "",
+    message: job.error || "",
     startedAt: job.startedAt,
     finishedAt: job.finishedAt
   };

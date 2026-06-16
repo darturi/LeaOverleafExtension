@@ -239,6 +239,56 @@
   border-bottom: 1px solid #e5e7eb;
 }
 
+.ol-lean-cost-cap-notice {
+  position: fixed;
+  z-index: 2147483647;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: min(280px, calc(100vw - 24px));
+  box-sizing: border-box;
+  padding: 10px 10px 10px 12px;
+  color: #7f1d1d;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(127, 29, 29, 0.16);
+  font: 12px/1.35 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.ol-lean-cost-cap-notice div {
+  min-width: 0;
+}
+
+.ol-lean-cost-cap-notice strong,
+.ol-lean-cost-cap-notice span {
+  display: block;
+}
+
+.ol-lean-cost-cap-notice strong {
+  margin-bottom: 2px;
+  color: #991b1b;
+  font-weight: 700;
+}
+
+.ol-lean-cost-cap-notice button {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: #991b1b;
+  background: transparent;
+  cursor: pointer;
+  font: 700 14px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.ol-lean-cost-cap-notice button:hover,
+.ol-lean-cost-cap-notice button:focus-visible {
+  background: #fee2e2;
+}
+
 .ol-lean-popover-header {
   display: flex;
   align-items: center;
@@ -502,6 +552,17 @@
 .ol-lean-usage-separator {
   height: 1px;
   background: #e5e7eb;
+}
+
+.ol-lean-usage-cap {
+  margin: 8px 0 0;
+  color: #6b7280;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.ol-lean-usage-cap[data-reached="true"] {
+  color: #b91c1c;
 }
 
 .ol-lean-provider-panel {

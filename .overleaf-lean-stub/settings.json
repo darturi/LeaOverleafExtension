@@ -6,5 +6,6 @@
   "leaMaxTurns": 10,
   "leaJobTimeoutSeconds": 900,
   "leaApiBaseUrl": "http://127.0.0.1:8000",
-  "leaTheoremTranslationMaxRetries": 1
+  "leaTheoremTranslationMaxRetries": 1,
+  "leaMaxSpendUsd": 0.09
 }

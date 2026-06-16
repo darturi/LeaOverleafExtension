@@ -26,6 +26,10 @@
   let latestStatuses = {};
   let badgeLayer = null;
   let settingsButton = null;
+  let costCapNotice = null;
+  let dismissedCostCapNoticeKeys = new Set();
+  let activeCostCapNoticeKeys = new Set();
+  let costCapUsageLimitReached = false;
 
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
@@ -142,6 +146,9 @@
           await refreshStatusesNow();
         } catch (error) {
           status.textContent = error instanceof Error ? error.message : String(error);
+          if (isMaxSpendError(error)) {
+            showCostCapNotice(null, { force: true, noticeKey: `error:${Date.now()}` });
+          }
           const latestStatus = latestStatuses[theorem.label] || { status: currentStatus };
           renderTheoremActions(actions, theorem, latestStatus.status || currentStatus, status, leanStatement, getActionStatus(latestStatus));
         }
@@ -238,6 +245,7 @@
               <span><small>Out</small><strong data-field="output">--</strong></span>
             </div>
           </div>
+          <p class="ol-lean-usage-cap" data-role="cost-cap-summary" hidden></p>
         </section>
         <section class="ol-lean-provider-panel" data-role="provider-keys">
           <div class="ol-lean-provider-title">Model families</div>
@@ -265,6 +273,10 @@
             <input type="number" min="1" max="200" data-role="max-turns">
           </label>
           <label>
+            <span>Cost cap (USD)</span>
+            <input type="number" min="0" step="0.01" data-role="max-spend" placeholder="None">
+          </label>
+          <label>
             <span>Translation retries</span>
             <input type="number" min="1" max="50" data-role="theorem-translation-max-retries">
           </label>
@@ -278,12 +290,14 @@
     const status = popover.querySelector(".ol-lean-popover-status");
     const modelSelect = popover.querySelector("[data-role='model']");
     const maxTurnsInput = popover.querySelector("[data-role='max-turns']");
+    const maxSpendInput = popover.querySelector("[data-role='max-spend']");
     const theoremTranslationMaxRetriesInput = popover.querySelector("[data-role='theorem-translation-max-retries']");
     const saveButton = popover.querySelector("[data-role='save-settings']");
 
     closeButton.addEventListener("click", closePopover);
     modelSelect.addEventListener("change", markSettingsDirty);
     maxTurnsInput.addEventListener("input", markSettingsDirty);
+    maxSpendInput.addEventListener("input", markSettingsDirty);
     theoremTranslationMaxRetriesInput.addEventListener("input", markSettingsDirty);
     for (const button of popover.querySelectorAll("[data-role='provider-key-toggle']")) {
       button.addEventListener("click", () => {
@@ -306,6 +320,7 @@
         const settings = await savePopoverSettings(popover);
         popover.dataset.savedModel = settings.leaModel;
         popover.dataset.savedMaxTurns = String(settings.leaMaxTurns);
+        popover.dataset.savedMaxSpend = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
         popover.dataset.savedTheoremTranslationMaxRetries = String(settings.leaTheoremTranslationMaxRetries);
         renderProviderKeys(popover, settings.leaProviderKeys || {});
         clearProviderKeyInputs(popover);
@@ -321,6 +336,7 @@
     document.body.appendChild(popover);
     positionSettingsPopover(popover);
     activePopover = popover;
+    positionCostCapNotice(popover);
     loadPopoverSettings(popover).catch((error) => {
       status.textContent = error instanceof Error ? error.message : String(error);
     });
@@ -337,6 +353,7 @@
       const selectedFamilyConfigured = Boolean(getEffectiveProviderKeyStatus(popover)[family]?.configured);
       const dirty = modelSelect.value !== popover.dataset.savedModel ||
         String(Number.parseInt(maxTurnsInput.value, 10) || DEFAULT_LEA_MAX_TURNS) !== popover.dataset.savedMaxTurns ||
+        normalizeMaxSpendInput(maxSpendInput.value) !== (popover.dataset.savedMaxSpend || "") ||
         String(Number.parseInt(theoremTranslationMaxRetriesInput.value, 10) || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES) !== popover.dataset.savedTheoremTranslationMaxRetries ||
         hasProviderKeyInput(popover);
       saveButton.disabled = !dirty || !selectedFamilyConfigured;
@@ -350,6 +367,7 @@
       activePopover.remove();
       activePopover = null;
     }
+    positionCostCapNotice();
   }
 
   function positionPopover(popover, clientX, clientY) {
@@ -520,6 +538,10 @@
 
   function postStatuses(statuses) {
     latestStatuses = statuses || {};
+    const noticeKey = maxSpendNoticeKeyFromStatuses(latestStatuses);
+    if (noticeKey) {
+      showCostCapNotice(null, { noticeKey });
+    }
     renderStatusBadges();
   }
 
@@ -698,6 +720,7 @@
       leaApiBaseUrl: "http://127.0.0.1:8000",
       leaModel: DEFAULT_LEA_MODEL,
       leaMaxTurns: DEFAULT_LEA_MAX_TURNS,
+      leaMaxSpendUsd: null,
       leaTheoremTranslationMaxRetries: DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES
     });
   }
@@ -717,6 +740,8 @@
         leaApiBaseUrl: payload.leaApiBaseUrl || stored.leaApiBaseUrl || "http://127.0.0.1:8000",
         leaModel: payload.leaModel || stored.leaModel || DEFAULT_LEA_MODEL,
         leaMaxTurns: payload.leaMaxTurns || stored.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
+        leaMaxSpendUsd: payload.leaMaxSpendUsd ?? stored.leaMaxSpendUsd ?? null,
+        leaCurrentSpendUsd: payload.leaCurrentSpendUsd ?? 0,
         leaTheoremTranslationMaxRetries: payload.leaTheoremTranslationMaxRetries || stored.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES,
         leaModelOptions: payload.leaModelOptions || DEFAULT_MODEL_OPTIONS,
         leaProviderKeys: payload.leaProviderKeys || {}
@@ -727,6 +752,7 @@
         leaApiBaseUrl: settings.leaApiBaseUrl,
         leaModel: settings.leaModel,
         leaMaxTurns: settings.leaMaxTurns,
+        leaMaxSpendUsd: settings.leaMaxSpendUsd,
         leaTheoremTranslationMaxRetries: settings.leaTheoremTranslationMaxRetries
       });
       return settings;
@@ -744,6 +770,7 @@
     const settings = await loadCompanionSettings();
     const modelSelect = popover.querySelector("[data-role='model']");
     const maxTurnsInput = popover.querySelector("[data-role='max-turns']");
+    const maxSpendInput = popover.querySelector("[data-role='max-spend']");
     const theoremTranslationMaxRetriesInput = popover.querySelector("[data-role='theorem-translation-max-retries']");
     popover.dataset.modelOptions = JSON.stringify(settings.leaModelOptions || DEFAULT_MODEL_OPTIONS);
     renderProviderKeys(popover, settings.leaProviderKeys || {});
@@ -754,9 +781,11 @@
       getEffectiveProviderKeyStatus(popover)
     );
     maxTurnsInput.value = String(settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS);
+    maxSpendInput.value = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
     theoremTranslationMaxRetriesInput.value = String(settings.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES);
     popover.dataset.savedModel = modelSelect.value;
     popover.dataset.savedMaxTurns = String(Number.parseInt(maxTurnsInput.value, 10) || DEFAULT_LEA_MAX_TURNS);
+    popover.dataset.savedMaxSpend = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
     popover.dataset.savedTheoremTranslationMaxRetries = String(Number.parseInt(theoremTranslationMaxRetriesInput.value, 10) || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES);
     popover.querySelector("[data-role='save-settings']").disabled = true;
   }
@@ -869,6 +898,7 @@
     const baseUrl = String(current.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
     const leaModel = popover.querySelector("[data-role='model']").value || DEFAULT_LEA_MODEL;
     const leaMaxTurns = Number.parseInt(popover.querySelector("[data-role='max-turns']").value, 10) || DEFAULT_LEA_MAX_TURNS;
+    const leaMaxSpendUsd = parseMaxSpendInput(popover.querySelector("[data-role='max-spend']").value);
     const leaTheoremTranslationMaxRetries = Number.parseInt(popover.querySelector("[data-role='theorem-translation-max-retries']").value, 10) || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES;
     const response = await fetch(`${baseUrl}/settings/lea`, {
       method: "POST",
@@ -878,6 +908,7 @@
         leaApiBaseUrl: current.leaApiBaseUrl,
         leaModel,
         leaMaxTurns,
+        leaMaxSpendUsd,
         leaTheoremTranslationMaxRetries,
         leaProviderApiKeys: collectProviderApiKeyPatch(popover)
       })
@@ -892,6 +923,7 @@
       leaApiBaseUrl: payload.leaApiBaseUrl,
       leaModel: payload.leaModel,
       leaMaxTurns: payload.leaMaxTurns,
+      leaMaxSpendUsd: payload.leaMaxSpendUsd,
       leaTheoremTranslationMaxRetries: payload.leaTheoremTranslationMaxRetries
     });
     return payload;
@@ -908,6 +940,7 @@
     }
     renderUsage(popover, "project", payload.project);
     renderUsage(popover, "allTime", payload.allTime);
+    renderCostCapSummary(popover, payload);
   }
 
   function scheduleUsageRefresh(popover) {
@@ -932,6 +965,149 @@
     row.querySelector("[data-field='cost']").textContent = formatCost(usage?.costUsd || 0);
     row.querySelector("[data-field='input']").textContent = formatTokens(usage?.inputTokens || 0);
     row.querySelector("[data-field='output']").textContent = formatTokens(usage?.outputTokens || 0);
+  }
+
+  function renderCostCapSummary(popover, payload) {
+    const summary = popover.querySelector("[data-role='cost-cap-summary']");
+    if (!summary) return;
+    const maxSpend = payload?.leaMaxSpendUsd;
+    if (maxSpend === null || maxSpend === undefined || maxSpend === "") {
+      summary.hidden = true;
+      summary.textContent = "";
+      costCapUsageLimitReached = false;
+      removeCostCapNotice();
+      return;
+    }
+    const current = payload?.leaCurrentSpendUsd ?? payload?.allTime?.costUsd ?? 0;
+    summary.hidden = false;
+    summary.textContent = `Cost cap: ${formatCost(current)} / ${formatCost(maxSpend)}`;
+    const reached = Boolean(payload?.leaSpendLimitReached);
+    summary.dataset.reached = reached ? "true" : "false";
+    if (reached) {
+      showCostCapNotice(popover, {
+        force: !costCapUsageLimitReached,
+        noticeKey: `usage:${maxSpend}:${current}`
+      });
+    } else {
+      removeCostCapNotice();
+    }
+    costCapUsageLimitReached = reached;
+  }
+
+  function showCostCapNotice(anchor = null, { force = false, noticeKey = "global" } = {}) {
+    if (force) {
+      dismissedCostCapNoticeKeys = new Set();
+    }
+    if (dismissedCostCapNoticeKeys.has(noticeKey)) return;
+    activeCostCapNoticeKeys.add(noticeKey);
+    if (!costCapNotice) {
+      costCapNotice = document.createElement("div");
+      costCapNotice.className = "ol-lean-cost-cap-notice";
+      costCapNotice.setAttribute("role", "alert");
+      costCapNotice.addEventListener("click", (event) => {
+        event.stopPropagation();
+      });
+      costCapNotice.innerHTML = `
+        <div>
+          <strong>Cost cap reached</strong>
+          <span>Lea stopped because the configured spend limit was reached.</span>
+        </div>
+        <button type="button" aria-label="Dismiss cost cap notice">x</button>
+      `;
+      costCapNotice.querySelector("button").addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        for (const key of activeCostCapNoticeKeys) {
+          dismissedCostCapNoticeKeys.add(key);
+        }
+        dismissedCostCapNoticeKeys.add(maxSpendNoticeKeyFromStatuses(latestStatuses));
+        removeCostCapNotice();
+      });
+      document.body.appendChild(costCapNotice);
+    }
+    positionCostCapNotice(anchor);
+  }
+
+  function positionCostCapNotice(anchor = null) {
+    if (!costCapNotice) return;
+    const settingsPopover = activePopover?.classList?.contains("ol-lean-settings-popover")
+      ? activePopover
+      : null;
+    const target = anchor?.isConnected
+      ? anchor
+      : settingsPopover?.isConnected
+        ? settingsPopover
+        : settingsButton?.isConnected
+          ? settingsButton
+          : null;
+    const noticeRect = costCapNotice.getBoundingClientRect();
+    const gap = 10;
+    if (!target) {
+      costCapNotice.dataset.position = "floating";
+      costCapNotice.style.left = `${Math.max(12, window.innerWidth - noticeRect.width - 20)}px`;
+      costCapNotice.style.top = `${Math.max(12, window.innerHeight - noticeRect.height - 20)}px`;
+      return;
+    }
+    const targetRect = target.getBoundingClientRect();
+    const belowTop = targetRect.bottom + gap;
+    const fitsBelow = belowTop + noticeRect.height <= window.innerHeight - 12;
+    const top = fitsBelow
+      ? belowTop
+      : Math.max(12, targetRect.top - noticeRect.height - gap);
+    const left = Math.min(
+      Math.max(12, targetRect.right - noticeRect.width),
+      window.innerWidth - noticeRect.width - 12
+    );
+    costCapNotice.dataset.position = fitsBelow ? "below" : "above";
+    costCapNotice.style.left = `${left}px`;
+    costCapNotice.style.top = `${top}px`;
+  }
+
+  function removeCostCapNotice() {
+    if (!costCapNotice) return;
+    costCapNotice.remove();
+    costCapNotice = null;
+    activeCostCapNoticeKeys = new Set();
+  }
+
+  function isMaxSpendStatus(statusInfo) {
+    return String(statusInfo?.message || "").includes("Max spend limit") ||
+      String(statusInfo?.finalStatus || "").toLowerCase() === "max_spend";
+  }
+
+  function maxSpendNoticeKeyFromStatuses(statuses) {
+    const parts = [];
+    for (const [theoremLabel, statusInfo] of Object.entries(statuses || {})) {
+      if (!isMaxSpendStatus(statusInfo)) continue;
+      parts.push([
+        theoremLabel,
+        statusInfo.jobId || "",
+        statusInfo.finishedAt || "",
+        statusInfo.message || ""
+      ].join(":"));
+    }
+    return parts.sort().join("|");
+  }
+
+  function isMaxSpendError(error) {
+    return String(error instanceof Error ? error.message : error).includes("Max spend limit");
+  }
+
+  function normalizeMaxSpendInput(value) {
+    const trimmed = String(value || "").trim();
+    if (!trimmed) return "";
+    const number = Number(trimmed);
+    return Number.isFinite(number) && number >= 0 ? String(number) : trimmed;
+  }
+
+  function parseMaxSpendInput(value) {
+    const trimmed = String(value || "").trim();
+    if (!trimmed) return null;
+    const number = Number(trimmed);
+    if (!Number.isFinite(number) || number < 0) {
+      throw new Error("Cost cap must be a non-negative dollar amount.");
+    }
+    return number;
   }
 
   function formatTokens(value) {

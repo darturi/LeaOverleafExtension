@@ -60,7 +60,15 @@ test("settings response includes model families and key status", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({
     leaRepoPath: leaRepo,
+    leaMaxSpendUsd: 0.5,
     env: { OPENAI_API_KEY: "env-openai", ANTHROPIC_API_KEY: "env-anthropic" }
+  });
+  state.jobs.usage = makeUsageJob({
+    jobId: "usage",
+    projectId: "project-1",
+    inputTokens: 100,
+    outputTokens: 50,
+    costUsd: 0.125
   });
 
   const response = buildSettingsResponse(state);
@@ -83,6 +91,8 @@ test("settings response includes model families and key status", async () => {
   assert.equal(response.leaProviderKeys.gemini.configured, false);
   assert.equal(response.leaProviderKeys.anthropic.configured, true);
   assert.equal(response.leaTheoremTranslationMaxRetries, 3);
+  assert.equal(response.leaMaxSpendUsd, 0.5);
+  assert.equal(response.leaCurrentSpendUsd, 0.125);
 });
 
 test("settings reject unsupported models and missing family keys", async () => {
@@ -117,6 +127,7 @@ test("settings save supported models when their family key is configured", async
     leaApiBaseUrl: "http://127.0.0.1:8000",
     leaModel: "gpt-5.4-mini",
     leaMaxTurns: 34,
+    leaMaxSpendUsd: 9.5,
     leaTheoremTranslationMaxRetries: 8
   }, state);
   const geminiResult = await handleUpdateLeaSettings({
@@ -136,6 +147,7 @@ test("settings save supported models when their family key is configured", async
   assert.equal(openAiResult.body.leaProvider, "openai");
   assert.equal(openAiResult.body.leaModel, "gpt-5.4-mini");
   assert.equal(openAiResult.body.leaMaxTurns, 34);
+  assert.equal(openAiResult.body.leaMaxSpendUsd, 9.5);
   assert.equal(openAiResult.body.leaTheoremTranslationMaxRetries, 8);
   assert.equal(geminiResult.statusCode, 200);
   assert.equal(geminiResult.body.leaProvider, "gemini");
@@ -146,6 +158,36 @@ test("settings save supported models when their family key is configured", async
 
   const saved = JSON.parse(await fs.readFile(state.settingsPath, "utf8"));
   assert.equal(saved.leaTheoremTranslationMaxRetries, 8);
+  assert.equal(saved.leaMaxSpendUsd, 9.5);
+});
+
+test("settings clear max spend and reject negative caps", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaMaxSpendUsd: 4,
+    env: { OPENAI_API_KEY: "openai-key" }
+  });
+
+  const cleared = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaModel: "o4-mini",
+    leaMaxTurns: 20,
+    leaMaxSpendUsd: null
+  }, state);
+  const negative = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaModel: "o4-mini",
+    leaMaxTurns: 20,
+    leaMaxSpendUsd: -1
+  }, state);
+
+  assert.equal(cleared.statusCode, 200);
+  assert.equal(cleared.body.leaMaxSpendUsd, null);
+  assert.equal(negative.statusCode, 400);
+  assert.equal(negative.body.error, "invalid_max_spend");
 });
 
 test("settings normalize legacy Anthropic model ids", async () => {
@@ -1541,9 +1583,150 @@ test("usage reflects live Lea event costs while a run is in progress", async () 
   });
 });
 
+test("formalize and stub block when max spend is already reached", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaMaxSpendUsd: 0.1,
+    env: { OPENAI_API_KEY: "test-key" }
+  });
+  state.jobs.previous = makeUsageJob({
+    jobId: "previous",
+    projectId: "project-1",
+    inputTokens: 100,
+    outputTokens: 50,
+    costUsd: 0.1
+  });
+
+  const formalize = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "blocked_formalize",
+    theoremText: "A theorem."
+  }, state);
+  const stub = await handleStub({
+    overleafProjectId: "project-1",
+    theoremLabel: "blocked_stub",
+    theoremText: "A theorem."
+  }, state);
+
+  assert.equal(formalize.statusCode, 402);
+  assert.equal(formalize.body.error, "max_spend_reached");
+  assert.equal(stub.statusCode, 402);
+  assert.equal(stub.body.message, "Max spend limit has been reached.");
+});
+
+test("formalize cancels and fails when live usage crosses max spend", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaMaxSpendUsd: 0.01,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls, {
+      eventFrames: [
+        { type: "usage_updated", input_tokens: 10, output_tokens: 5, cost: 0.02 }
+      ]
+    })
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "max_spend_formalize",
+    theoremText: "A theorem."
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  await waitFor(() => state.jobs[result.body.jobId]?.finalStatus === "max_spend");
+  const job = state.jobs[result.body.jobId];
+  assert.equal(job.status, "failed");
+  assert.equal(job.error, "Max spend limit reached. Lea run was cancelled.");
+  assert.equal(job.costUsd, 0.02);
+  assert.ok(calls.some((call) => String(call.url).endsWith("/v1/runs/api-run-1/cancel")));
+  assert.match(await fs.readFile(job.logPath, "utf8"), /Max spend limit reached/);
+});
+
+test("stub cancels and fails when live usage crosses max spend", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaMaxSpendUsd: 0.01,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls, {
+      eventFrames: [
+        { type: "usage_updated", input_tokens: 10, output_tokens: 5, cost: 0.02 }
+      ],
+      approval: {
+        leanCode: "import Mathlib\n\ntheorem max_spend_stub : True := by sorry",
+        theoremName: "max_spend_stub"
+      }
+    })
+  });
+
+  const result = await handleStub({
+    overleafProjectId: "project-1",
+    theoremLabel: "max_spend_stub",
+    theoremText: "A theorem."
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  const job = state.jobs[result.body.jobId];
+  assert.equal(result.body.status, "failed");
+  assert.equal(job.finalStatus, "max_spend");
+  assert.equal(job.status, "failed");
+  assert.equal(job.costUsd, 0.02);
+  assert.ok(calls.some((call) => String(call.url).endsWith("/v1/runs/api-run-1/cancel")));
+});
+
+test("formalize after stub cancels and fails when resumed usage crosses max spend", async () => {
+  const leaRepo = await makeLeaRepo();
+  const stubCalls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(stubCalls, {
+      approval: {
+        leanCode: "import Mathlib\n\ntheorem max_spend_resume : True := by sorry",
+        theoremName: "max_spend_resume"
+      }
+    })
+  });
+  const stubResult = await handleStub({
+    overleafProjectId: "project-1",
+    theoremLabel: "max_spend_resume",
+    theoremText: "A theorem."
+  }, state);
+  assert.equal(stubResult.statusCode, 200);
+  assert.equal(stubResult.body.status, "sorry_stub");
+
+  const resumeCalls = [];
+  state.settings.leaMaxSpendUsd = 0.01;
+  state.fetchImpl = makeLeaApiFetch(resumeCalls, {
+    approval: {
+      leanCode: "import Mathlib\n\ntheorem max_spend_resume : True := by sorry",
+      theoremName: "max_spend_resume"
+    },
+    eventFrames: [
+      { type: "usage_updated", input_tokens: 10, output_tokens: 5, cost: 0.02 }
+    ]
+  });
+  const formalizeResult = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "max_spend_resume",
+    theoremText: "A theorem."
+  }, state);
+
+  assert.equal(formalizeResult.statusCode, 200);
+  await waitFor(() => state.jobs[stubResult.body.jobId]?.finalStatus === "max_spend");
+  const job = state.jobs[stubResult.body.jobId];
+  assert.equal(job.status, "failed");
+  assert.equal(job.costUsd, 0.02);
+  assert.ok(resumeCalls.some((call) => String(call.url).endsWith("/v1/runs/api-run-1/cancel")));
+});
+
 test("usage aggregates project and all-time completed run totals", async () => {
   const leaRepo = await makeLeaRepo();
-  const state = await makeState({ leaRepoPath: leaRepo });
+  const state = await makeState({ leaRepoPath: leaRepo, leaMaxSpendUsd: 1 });
   state.jobs.project_a_first = makeUsageJob({
     jobId: "project_a_first",
     projectId: "project-a",
@@ -1589,6 +1772,9 @@ test("usage aggregates project and all-time completed run totals", async () => {
     costUsd: 0.48,
     runCount: 3
   });
+  assert.equal(result.body.leaMaxSpendUsd, 1);
+  assert.equal(result.body.leaCurrentSpendUsd, 0.48);
+  assert.equal(result.body.leaSpendLimitReached, false);
 });
 
 test("formalize cleans previous failed Lea artifacts before retrying", async () => {
@@ -2051,6 +2237,7 @@ async function makeState(overrides = {}) {
         leaProviderApiKeys: overrides.leaProviderApiKeys || {},
         ...(overrides.leaApiKey ? { leaApiKey: overrides.leaApiKey } : {}),
         leaMaxTurns: 20,
+        leaMaxSpendUsd: overrides.leaMaxSpendUsd ?? null,
         leaTheoremTranslationMaxRetries: overrides.leaTheoremTranslationMaxRetries || 3,
         ...(overrides.leaJobTimeoutSeconds ? {
           leaJobTimeoutSeconds: overrides.leaJobTimeoutSeconds
@@ -2095,6 +2282,9 @@ function makeLeaApiFetch(calls, options = {}) {
   return async (url, requestOptions = {}) => {
     const body = requestOptions.body ? JSON.parse(requestOptions.body) : null;
     calls.push({ url, options: requestOptions, body });
+    if (String(url).endsWith("/cancel") || requestOptions.method === "DELETE") {
+      return jsonResponse(options.cancelStatus || 200, options.cancelBody || { status: "cancelled" });
+    }
     if (String(url).endsWith("/v1/runs")) {
       return jsonResponse(200, { run_id: "api-run-1", status: "running" });
     }
