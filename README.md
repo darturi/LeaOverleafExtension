@@ -2,6 +2,8 @@
 
 This repository contains a local MVP for sending labeled Overleaf theorem blocks to Lea and tracking the resulting Lean proofs in Lea's own workspace.
 
+For beta testers installing from a pinned release tag, see [BETA_INSTALL.md](BETA_INSTALL.md).
+
 ## Pieces
 
 - `extension/`: Chrome MV3 extension for Overleaf.

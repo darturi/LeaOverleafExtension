@@ -10,7 +10,6 @@ const APP_DIR = path.join(PROJECT_ROOT, ".overleaf-lean-stub");
 const SETTINGS_PATH = path.join(APP_DIR, "settings.json");
 const ENV_PATH = path.join(PROJECT_ROOT, ".env");
 const LEA_REPO_URL = "https://github.com/darturi/lea-prover.git";
-const LEA_REPO_BRANCH = "main";
 const LEA_REPO_PATH = path.join(PROJECT_ROOT, "vendor", "lea-prover");
 const LEA_WORKSPACE_PATH = path.join(LEA_REPO_PATH, "workspace");
 const MATHLIB_PACKAGE_PATH = path.join(LEA_WORKSPACE_PATH, ".lake", "packages", "mathlib");
@@ -50,11 +49,9 @@ async function ensureLeaRepo() {
   await fs.mkdir(path.dirname(LEA_REPO_PATH), { recursive: true });
 
   if (existsSync(path.join(LEA_REPO_PATH, ".git"))) {
-    console.log("Updating Lea submodule checkout...");
-    await run("git", ["remote", "set-url", "origin", LEA_REPO_URL], { cwd: LEA_REPO_PATH });
-    await run("git", ["fetch", "origin", LEA_REPO_BRANCH], { cwd: LEA_REPO_PATH });
-    await run("git", ["checkout", LEA_REPO_BRANCH], { cwd: LEA_REPO_PATH });
-    await run("git", ["pull", "--ff-only"], { cwd: LEA_REPO_PATH });
+    console.log("Updating Lea submodule to the commit pinned by this checkout...");
+    await run("git", ["submodule", "sync", "--recursive", LEA_REPO_PATH], { cwd: PROJECT_ROOT });
+    await run("git", ["submodule", "update", "--init", "--recursive", LEA_REPO_PATH], { cwd: PROJECT_ROOT });
     return;
   }
 
